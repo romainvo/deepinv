@@ -27,6 +27,7 @@ from .noise import (
 )
 from .mri import MRI, DynamicMRI, SequentialMRI, MultiCoilMRI, MRIMixin
 from .tomography import Tomography, TomographyWithAstra
+from .multiscale import MultiScaleLinearPhysics, Pad
 from .lidar import SinglePhotonLidar
 from .singlepixel import SinglePixelCamera
 from .remote_sensing import Pansharpen
