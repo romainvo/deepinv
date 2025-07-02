@@ -457,8 +457,12 @@ class LinearPhysics(Physics):
         x /= torch.norm(x)
         zold = torch.zeros_like(x)
         for it in range(max_iter):
-            y = self.A(x, **kwargs)
-            y = self.A_adjoint(y, **kwargs)
+            if hasattr(self, "A_adjoint_A"):
+                # If A_adjoint_A is defined, use it to compute the norm
+                y = self.A_adjoint_A(x, **kwargs)
+            else:
+                y = self.A(x, **kwargs)
+                y = self.A_adjoint(y, **kwargs)
             z = torch.matmul(x.conj().reshape(-1), y.reshape(-1)) / torch.norm(x) ** 2
 
             rel_var = torch.norm(z - zold)
