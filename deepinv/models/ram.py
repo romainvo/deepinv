@@ -117,7 +117,7 @@ class RAM(Reconstructor):
         gamma_map = self.constant2map(gamma, x)
         return torch.cat((x, noise_level_map, gamma_map), 1)
 
-    def realign_input(self, x, physics, y):
+    def realign_input(self, x, physics, y, solver='CG'):
         r"""
         Realign the input x based on the measurements y and the physics model.
         Applies the proximity operator of the L2 norm with respect to the physics model.
@@ -164,11 +164,11 @@ class RAM(Reconstructor):
         snr = num / (sigma + 1e-4)  # SNR equivariant
         gamma = 1 / (1e-4 + 1 / (snr * f**2))
         gamma = gamma[(...,) + (None,) * (x.dim() - 1)]
-        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign)
+        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign , solver=solver) # * 0.008
 
         return model_input
 
-    def forward_unet(self, x0, sigma=None, gamma=None, physics=None, y=None):
+    def forward_unet(self, x0, sigma=None, gamma=None, physics=None, y=None, solver='CG'):
         r"""
         Forward pass of the UNet model.
 
@@ -187,7 +187,7 @@ class RAM(Reconstructor):
             )
 
         if y is not None:
-            x0 = self.realign_input(x0, physics, y)
+            x0 = self.realign_input(x0, physics, y, solver=solver)
 
         x0 = self.base_conditioning(x0, sigma, gamma)
 
@@ -217,7 +217,7 @@ class RAM(Reconstructor):
 
         return x
 
-    def forward(self, y=None, physics=None):
+    def forward(self, y=None, physics=None, solver='CG'):
         r"""
         Reconstructs a signal estimate from measurements y
         :param torch.tensor y: measurements
@@ -228,9 +228,9 @@ class RAM(Reconstructor):
                 noise_model=dinv.physics.GaussianNoise(sigma=0.0), device=y.device
             )
 
-        x_temp = physics.A_adjoint(y)
-        pad = (-x_temp.size(-2) % 8, -x_temp.size(-1) % 8)
-        physics = Pad(physics, pad)
+        # x_temp = physics.A_adjoint(y)
+        # pad = (-x_temp.size(-2) % 8, -x_temp.size(-1) % 8)
+        # physics = Pad(physics, pad)
 
         x_in = physics.A_adjoint(y)
 
@@ -241,9 +241,9 @@ class RAM(Reconstructor):
             physics.noise_model.gain if hasattr(physics.noise_model, "gain") else 1e-3
         )
 
-        out = self.forward_unet(x_in, sigma=sigma, gamma=gamma, physics=physics, y=y)
+        out = self.forward_unet(x_in, sigma=sigma, gamma=gamma, physics=physics, y=y, solver=solver)
 
-        out = physics.remove_pad(out)
+        # out = physics.remove_pad(out)
 
         return out
 
@@ -299,7 +299,14 @@ def krylov_embeddings(y, p, factor, v=None, N=4, x_init=None):
         x = x_init.clone()  # Extract the first img_channels
 
     norm = factor**2  # Precompute normalization factor
-    AtA = lambda u: p.A_adjoint(p.A(u)) * norm  # Define the linear operator
+    # AtA = lambda u: p.A_adjoint(p.A(u)) * norm  # Define the linear operator
+    if hasattr(p, "A_adjoint_A_approx"):
+        AtA = lambda u: p.A_adjoint_A_approx(u) * norm
+    elif hasattr(p, "A_adjoint_A"):
+        AtA = lambda u: p.A_adjoint_A(u) * norm
+    
+    else:
+        AtA = lambda u: p.A_adjoint(p.A(u)) * norm
 
     v = v if v is not None else torch.zeros_like(x)
 

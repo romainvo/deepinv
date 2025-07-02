@@ -299,6 +299,9 @@ class AutogradTransform(torch.autograd.Function):
         :param XrayTransform op: XrayTransform operator which performs underlying computations.
         :return:
         """
+        
+        input = input.contiguous()
+        
         if op.is_2d:
             B, C, H, W = input.shape
             assert (1, H, W) == op.domain_shape, f"{(1,H,W)} != {op.domain_shape}"
