@@ -164,7 +164,7 @@ class RAM(Reconstructor):
         snr = num / (sigma + 1e-4)  # SNR equivariant
         gamma = 1 / (1e-4 + 1 / (snr * f**2))
         gamma = gamma[(...,) + (None,) * (x.dim() - 1)]
-        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign , solver=solver) # * 0.008
+        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign *1e5, solver=solver) # * 0.008
 
         return model_input
 

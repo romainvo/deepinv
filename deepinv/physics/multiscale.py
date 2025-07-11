@@ -117,17 +117,17 @@ class MultiScaleLinearPhysics(MultiScalePhysics, LinearPhysics):
             out = self.Upsamplings[self.scale - 1].A_adjoint(out)
             return out
         
-    def A_adjoint_A_approx(self, x, scale=None, **kwargs):
-        self.set_scale(scale)
-        if self.scale == 0:
-            return self.base.A_adjoint_A_approx(x, **kwargs)
-        else:
-            # upscale the coarse signal to native resolution
-            out = self.Upsamplings[self.scale - 1].A(x)
-            out = self.base.A_adjoint_A_approx(out, **kwargs)
-            # downsample the signal to the coarse resolution
-            out = self.Upsamplings[self.scale - 1].A_adjoint(out)
-            return out
+    # def A_adjoint_A_approx(self, x, scale=None, **kwargs):
+    #     self.set_scale(scale)
+    #     if self.scale == 0:
+    #         return self.base.A_adjoint_A_approx(x, **kwargs)
+    #     else:
+    #         # upscale the coarse signal to native resolution
+    #         out = self.Upsamplings[self.scale - 1].A(x)
+    #         out = self.base.A_adjoint_A_approx(out, **kwargs)
+    #         # downsample the signal to the coarse resolution
+    #         out = self.Upsamplings[self.scale - 1].A_adjoint(out)
+    #         return out
 
 
 class Pad(LinearPhysics):
