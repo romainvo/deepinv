@@ -238,6 +238,8 @@ def conjugate_gradient(
     if eta > 0 and x0 is not None:
         b = b + eta * x0
         B = lambda x: A(x) + eta * x
+    else:
+        B = A
 
     r = b - B(x)
     p = r
