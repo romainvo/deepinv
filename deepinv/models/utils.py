@@ -31,12 +31,24 @@ def test_pad(model, L, modulo=16):
 
     Code borrowed from Kai Zhang https://github.com/cszn/DPIR/tree/master/models
     """
-    h, w = L.size()[-2:]
-    padding_bottom = int(np.ceil(h / modulo) * modulo - h)
-    padding_right = int(np.ceil(w / modulo) * modulo - w)
-    L = torch.nn.ReplicationPad2d((0, padding_right, 0, padding_bottom))(L)
-    E = model(L)
-    E = E[..., :h, :w]
+    if len(L.size()) == 4:   
+        h, w = L.size()[-2:]
+        padding_bottom = int(np.ceil(h / modulo) * modulo - h)
+        padding_right = int(np.ceil(w / modulo) * modulo - w)
+        L = torch.nn.ReplicationPad2d((0, padding_right, 0, padding_bottom))(L)
+        E = model(L)
+        E = E[..., :h, :w]
+
+    elif len(L.size()) == 5: # 3d input
+        d, h, w = L.size()[-3:]
+        padding_bottom = int(np.ceil(h / modulo) * modulo - h)
+        padding_right = int(np.ceil(w / modulo) * modulo - w)
+        padding_depth = int(np.ceil(d / modulo) * modulo - d)
+
+        L = torch.nn.ReplicationPad3d((0, padding_right, 0, padding_bottom, 0, padding_depth))(L)
+        E = model(L)
+        E = E[..., :d, :h, :w]
+
     return E
 
 
