@@ -79,7 +79,14 @@ class RAM(Reconstructor):
         self.m_tail = OutTail(nc[0], in_channels)
 
         # load pretrained weights from hugging face
-        if pretrained:
+        if type(pretrained) is str:
+            self.load_state_dict(
+                torch.load(
+                    pretrained,
+                    map_location=device,
+                )
+            )
+        elif pretrained:
             self.load_state_dict(
                 torch.load(
                     hf_hub_download(repo_id="mterris/ram", filename="ram.pth.tar"),
@@ -164,7 +171,7 @@ class RAM(Reconstructor):
         snr = num / (sigma + 1e-4)  # SNR equivariant
         gamma = 1 / (1e-4 + 1 / (snr * f**2))
         gamma = gamma[(...,) + (None,) * (x.dim() - 1)]
-        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign *1e5, solver=solver) # * 0.008
+        model_input = physics.prox_l2(x, y, gamma=gamma * self.fact_realign * 0.005, solver=solver) # * 0.008
 
         return model_input
 
