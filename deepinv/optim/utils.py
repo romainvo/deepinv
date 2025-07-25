@@ -130,9 +130,16 @@ def least_squares(
                     b = Aty
 
         if solver == "CG":
+            if gamma is not None:
+                eta = 1 / gamma
+            else:
+                eta = 0
+
             x = conjugate_gradient(
                 A=H,
                 b=b,
+                x0=z,
+                eta=eta,
                 init=init,
                 max_iter=max_iter,
                 tol=tol,
@@ -185,6 +192,8 @@ def dot(a, b, dim):
 def conjugate_gradient(
     A: Callable,
     b: torch.Tensor,
+    x0: torch.Tensor = None,
+    eta: float = 0.0,
     max_iter: float = 1e2,
     tol: float = 1e-5,
     eps: float = 1e-8,
@@ -225,8 +234,14 @@ def conjugate_gradient(
         x = init
     else:
         x = zeros_like(b)
+        
+    if eta > 0 and x0 is not None:
+        b = b + eta * x0
+        B = lambda x: A(x) + eta * x
+    else:
+        B = A
 
-    r = b - A(x)
+    r = b - B(x)
     p = r
     rsold = dot(r, r, dim=dim).real
     flag = True
