@@ -48,6 +48,7 @@ class DRUNet(Denoiser):
         downsample_mode="strideconv",
         upsample_mode="convtranspose",
         pretrained="download",
+        checkpoint=None,
         device=None,
     ):
         super(DRUNet, self).__init__()
@@ -149,6 +150,10 @@ class DRUNet(Denoiser):
             self.eval()
         else:
             self.apply(weights_init_drunet)
+
+        if checkpoint is not None:
+            self.load_state_dict(checkpoint, strict=True)
+            self.eval()
 
         if device is not None:
             self.to(device)
