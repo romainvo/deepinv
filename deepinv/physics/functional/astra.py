@@ -34,12 +34,16 @@ class XrayTransform:
         projection_geometry: dict[str, Any],
         object_geometry: dict[str, Any],
         is_2d: bool = False,
+        gpu_index: int=None
     ):
         import astra
 
         self.projection_geometry = projection_geometry
         self.object_geometry = object_geometry
         self.is_2d = is_2d
+        self.gpu_index = gpu_index
+        
+        astra.set_gpu_index(gpu_index)
 
         self._astra_projector_id = astra.create_projector(
             "cuda3d", self.projection_geometry, self.object_geometry
@@ -227,7 +231,7 @@ class XrayTransform:
         return _Adjoint()
 
     def _forward_projection(self, x: torch.Tensor, out: torch.Tensor) -> None:
-        import astra
+        import astra.experimental
 
         assert (
             x.shape == self.domain_shape
@@ -248,7 +252,7 @@ class XrayTransform:
         )
 
     def _backprojection(self, y: torch.Tensor, out: torch.Tensor) -> None:
-        import astra
+        import astra.experimental
 
         assert (
             y.shape == self.range_shape

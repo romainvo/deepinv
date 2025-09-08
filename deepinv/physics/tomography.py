@@ -457,6 +457,7 @@ class TomographyWithAstra(LinearPhysics):
         geometry_vectors: Optional[torch.Tensor] = None,
         normalize: bool = False,
         device: Union[torch.device, str] = torch.device("cuda"),
+        gpu_index: int=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -506,10 +507,12 @@ class TomographyWithAstra(LinearPhysics):
             geometry_vectors=geometry_vectors,
         )
 
+        self.gpu_index = 0 if gpu_index is None else gpu_index
         self.xray_transform = XrayTransform(
             object_geometry=self.object_geometry,
             projection_geometry=self.projection_geometry,
             is_2d=self.is_2d,
+            gpu_index=gpu_index
         )
 
         self.filter = RampFilter(dtype=torch.float32, device=self.device)
