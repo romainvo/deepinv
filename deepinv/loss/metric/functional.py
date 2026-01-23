@@ -21,7 +21,9 @@ def cal_psnr(
     :param float min_pixel: minimum pixel value
     """
     with torch.no_grad():
-        psnr = -10.0 * torch.log10(cal_mse(a, b) / (max_pixel - min_pixel) ** 2 + 1e-8)
+        pixel_range = max_pixel - min_pixel
+        pixel_range[pixel_range == 0] = 1.0  # avoid division by zero
+        psnr = -10.0 * torch.log10(cal_mse(a, b) / pixel_range ** 2 + 1e-8)
     return psnr
 
 

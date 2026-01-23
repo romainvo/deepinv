@@ -8,6 +8,7 @@ import deepinv as dinv
 from deepinv.physics import LinearPhysicsMultiScaler, PhysicsCropper
 from deepinv.utils.tensorlist import TensorList
 from deepinv.models.base import Reconstructor, Denoiser
+from deepinv.models.utils import LayerNorm_AF2d
 
 
 class RAM(Reconstructor, Denoiser):
@@ -54,6 +55,7 @@ class RAM(Reconstructor, Denoiser):
         in_channels=(1, 2, 3),
         device=None,
         pretrained=True,
+        normalization=False,
     ):
         super(RAM, self).__init__()
 
@@ -75,25 +77,25 @@ class RAM(Reconstructor, Denoiser):
         self.m_head = InHead(in_channels_first, nc[0])
 
         self.m_down1 = BaseEncBlock(
-            nc[0], nc[0], img_channels=in_channels, decode_upscale=1
+            nc[0], nc[0], img_channels=in_channels, decode_upscale=1, normalization=normalization
         )
         self.m_down2 = BaseEncBlock(
-            nc[1], nc[1], img_channels=in_channels, decode_upscale=2
+            nc[1], nc[1], img_channels=in_channels, decode_upscale=2, normalization=normalization
         )
         self.m_down3 = BaseEncBlock(
-            nc[2], nc[2], img_channels=in_channels, decode_upscale=4
+            nc[2], nc[2], img_channels=in_channels, decode_upscale=4, normalization=normalization
         )
         self.m_body = BaseEncBlock(
-            nc[3], nc[3], img_channels=in_channels, decode_upscale=8
+            nc[3], nc[3], img_channels=in_channels, decode_upscale=8, normalization=normalization
         )
         self.m_up3 = BaseEncBlock(
-            nc[2], nc[2], img_channels=in_channels, decode_upscale=4
+            nc[2], nc[2], img_channels=in_channels, decode_upscale=4, normalization=normalization
         )
         self.m_up2 = BaseEncBlock(
-            nc[1], nc[1], img_channels=in_channels, decode_upscale=2
+            nc[1], nc[1], img_channels=in_channels, decode_upscale=2, normalization=normalization
         )
         self.m_up1 = BaseEncBlock(
-            nc[0], nc[0], img_channels=in_channels, decode_upscale=1
+            nc[0], nc[0], img_channels=in_channels, decode_upscale=1, normalization=normalization
         )
 
         self.pool1 = downsample_strideconv(nc[0], nc[1], bias=False, mode="2")
@@ -429,6 +431,7 @@ class BaseEncBlock(nn.Module):
         nb=4,
         img_channels=None,
         decode_upscale=None,
+        normalization=False
     ):
         super(BaseEncBlock, self).__init__()
         self.enc = nn.ModuleList(
@@ -439,6 +442,7 @@ class BaseEncBlock(nn.Module):
                     bias=bias,
                     img_channels=img_channels,
                     decode_upscale=decode_upscale,
+                    normalization=normalization
                 )
                 for _ in range(nb)
             ]
@@ -597,6 +601,7 @@ class ResBlock(nn.Module):
         N=2,
         c_mult=2,
         depth_encoding=2,
+        normalization=False
     ):
         super(ResBlock, self).__init__()
 
@@ -607,7 +612,8 @@ class ResBlock(nn.Module):
         self.separate_head = isinstance(img_channels, list)
         self.is_head = head
         self.is_tail = tail
-
+        self.is_normalization = normalization
+        
         if self.is_head:
             self.head = InHead(img_channels, out_channels, input_layer=True)
 
@@ -632,6 +638,9 @@ class ResBlock(nn.Module):
                 "C",
             )
 
+            if self.is_normalization:
+                self.normalization = LayerNorm_AF2d(out_channels)
+            
         self.gain = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=True)
         self.PhysicsBlock = MeasCondBlock(
             out_channels=out_channels,
@@ -653,6 +662,9 @@ class ResBlock(nn.Module):
         :param int scale: Scale factor for the encoding block.
         """
         u = self.conv1(x)
+        # Conv -> batch -> ReLU: https://github.com/huggingface/pytorch-image-models/blob/5853f99e4dfbeb9cd83b86f10d8c352227b6a08f/timm/models/resnet.py#L132
+        if self.is_normalization:
+            u = self.normalization(u)
         u = self.nl(u)
         u_2 = self.conv2(u)
         emb_grad = self.PhysicsBlock(

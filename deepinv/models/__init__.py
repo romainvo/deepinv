@@ -1,5 +1,6 @@
 from .base import Denoiser, Reconstructor
 from .drunet import DRUNet
+from .drunet_cond import DRUNetCond
 from .scunet import SCUNet
 from .ae import AutoEncoder
 from .dncnn import DnCNN
@@ -39,3 +40,4 @@ from .ram import RAM
 from .client import Client
 from .wrapper import DiffusersDenoiserWrapper, ComplexDenoiserWrapper
 from .poisson2sparse import ConvLista, Poisson2Sparse
+from .ram_v2 import RAMv2

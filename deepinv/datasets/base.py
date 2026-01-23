@@ -244,6 +244,8 @@ class TensorDataset(ImageDataset):
             return x, self.y[idx], {k: v[idx] for (k, v) in self.params.items()}
 
 
+from collections import OrderedDict
+
 class ImageFolder(ImageDataset):
     """Dataset loading images from files.
 
@@ -390,12 +392,17 @@ class ImageFolder(ImageDataset):
 
         params = self.estimate_params(x, y) if self.estimate_params is not None else {}
 
-        out = (x,)
+        out = OrderedDict()
+        out['x'] = x
+        # out = (x,)
 
         if y is not None:
-            out += (y,)
+            # out += (y,)
+            out["y"] = y
 
         if params:
-            out += (params,)
-
-        return out[0] if len(out) == 1 else out
+            # out += (params,)
+            out["params"] = params
+        
+        return out
+        # return out[0] if len(out) == 1 else out

@@ -434,6 +434,31 @@ class PositionalEmbedding(torch.nn.Module):
 # ----------------------------------------------------------------------------
 # Timestep embedding used in the NCSN++ architecture.
 
+class LayerNorm_AF2d(nn.Module):
+    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first.
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs
+    with shape (batch_size, channels, height, width).
+    """
+
+    def __init__(self, normalized_shape, eps=1e-6, u_dims=(1,), s_dims=(1, 2, 3)):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+
+        self.normalized_shape = (normalized_shape,)
+        self.u_dims = u_dims
+        self.s_dims = s_dims
+
+    def forward(self, x):
+
+        u = x.mean(self.u_dims, keepdim=True)
+        s = (x - u).pow(2).mean(self.s_dims, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        x = self.weight[:, None, None] * x + self.bias[:, None, None]
+
+        return x
 
 class FourierEmbedding(torch.nn.Module):
     def __init__(self, num_channels: int, scale: int = 16):

@@ -13,6 +13,7 @@ from .utils import (
     instancenorm_nd,
     maxpool_nd,
     avgpool_nd,
+    LayerNorm_AF2d
 )
 from .base import Denoiser
 from collections import OrderedDict
@@ -61,6 +62,7 @@ class DRUNet(Denoiser):
         pretrained: str | None = "download",
         device: torch.device | str = None,
         dim: str | int = 2,
+        normalization: bool = False,
     ):
         super(DRUNet, self).__init__()
 
@@ -81,23 +83,25 @@ class DRUNet(Denoiser):
                 "downsample mode [{:s}] is not found".format(downsample_mode)
             )
 
+        mode = "CN" + act_mode + "C" if normalization else "C" + act_mode + "C"
+        
         self.m_down1 = sequential(
             *[
-                ResBlock(nc[0], nc[0], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[0], nc[0], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
             downsample_block(nc[0], nc[1], bias=False, mode="2", dim=dim),
         )
         self.m_down2 = sequential(
             *[
-                ResBlock(nc[1], nc[1], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[1], nc[1], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
             downsample_block(nc[1], nc[2], bias=False, mode="2", dim=dim),
         )
         self.m_down3 = sequential(
             *[
-                ResBlock(nc[2], nc[2], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[2], nc[2], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
             downsample_block(nc[2], nc[3], bias=False, mode="2", dim=dim),
@@ -105,7 +109,7 @@ class DRUNet(Denoiser):
 
         self.m_body = sequential(
             *[
-                ResBlock(nc[3], nc[3], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[3], nc[3], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ]
         )
@@ -125,21 +129,21 @@ class DRUNet(Denoiser):
         self.m_up3 = sequential(
             upsample_block(nc[3], nc[2], bias=False, mode="2", dim=dim),
             *[
-                ResBlock(nc[2], nc[2], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[2], nc[2], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
         )
         self.m_up2 = sequential(
             upsample_block(nc[2], nc[1], bias=False, mode="2", dim=dim),
             *[
-                ResBlock(nc[1], nc[1], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[1], nc[1], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
         )
         self.m_up1 = sequential(
             upsample_block(nc[1], nc[0], bias=False, mode="2", dim=dim),
             *[
-                ResBlock(nc[0], nc[0], bias=False, mode="C" + act_mode + "C", dim=dim)
+                ResBlock(nc[0], nc[0], bias=False, mode=mode, dim=dim)
                 for _ in range(nb)
             ],
         )
@@ -313,6 +317,10 @@ def conv(
                     padding=padding,
                     bias=bias,
                 )
+            )
+        elif t == "N":
+            L.append(
+                LayerNorm_AF2d(out_channels)
             )
         elif t == "B":
             L.append(
