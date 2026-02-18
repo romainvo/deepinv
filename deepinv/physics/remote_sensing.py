@@ -89,12 +89,13 @@ class Pansharpen(StackedLinearPhysics):
             noise_model=noise_color,
             device=device,
             padding=padding,
+            normalize=normalize,
         )
         decolorize = Decolorize(
-            srf=srf, noise_model=noise_gray, channels=img_size[0], device=device
+            srf=srf, noise_model=noise_gray, channels=img_size[0], device=device, normalize=normalize
         )
 
-        super().__init__(physics_list=[downsampling, decolorize], **kwargs)
+        super().__init__(physics_list=[downsampling, decolorize], reduction='mean' if self.normalize else 'sum', **kwargs)
 
         # Set convenience attributes
         self.downsampling = downsampling

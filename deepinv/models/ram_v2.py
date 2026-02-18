@@ -11,7 +11,9 @@ from deepinv.models.base import Reconstructor, Denoiser
 from deepinv.models.utils import LayerNorm_AF2d
 
 class CSEmbedding(nn.Module):
-    def __init__(self, z_dim: int, embed_dim: int, kernel_size=7, activation: str = "SiLU"):
+    # old kernel size was 7 (not parametrizable for the moment, k=3 breaks dependency with first checkpoints)
+    # embed dim was not set as kwarg, default to 64 for low complexity
+    def __init__(self, z_dim: int, embed_dim: int=64, kernel_size=3, activation: str = "SiLU"):
         super(CSEmbedding, self).__init__()
         self.linear1 = nn.Conv2d(z_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
         self.act = getattr(nn, activation)()
@@ -22,6 +24,30 @@ class CSEmbedding(nn.Module):
         z = self.act(z)
         z = self.linear2(z)
         return z
+    
+class LayerEmbedding(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, bias: bool = False, use_scale_shift_norm: bool=False):
+        super(LayerEmbedding, self).__init__()
+        
+        out_channels = 2 * out_channels if use_scale_shift_norm else out_channels
+        
+        self.linear_in = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=bias)
+        
+        self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
+        self.linear1 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=bias)
+        self.act1 = nn.ReLU(inplace=False)
+
+        self.linear2 = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=bias)
+        self.act2 = nn.ReLU(inplace=False)
+     
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x_in = self.linear_in(z)
+        skip = self.skip(x_in)
+        x = self.linear1(x_in)
+        x = self.act1(x)
+        x = self.linear2(x) + skip
+        x = self.act2(x)
+        return x
 
 class RAMv2(Reconstructor, Denoiser):
     r"""
@@ -76,8 +102,12 @@ class RAMv2(Reconstructor, Denoiser):
         last_only_conditioning_list=[],
         conditioning_dim=0,
         z_embedding_dim=0,
+        use_scale_shift_norm=False,
+        channel_only_conditioning=False, # if True, only use channel-wise conditioning (no spatial conditioning), only for the measurement conditioning part
         krylov_degree=2,
-        forward_iterates=False
+        forward_iterates=False,
+        nc: tuple[int,int,int,int] = (64, 128, 256, 512),
+        nb: int = 4
     ):
         super(RAMv2, self).__init__()
 
@@ -96,12 +126,16 @@ class RAMv2(Reconstructor, Denoiser):
             
         self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.channel_only_conditioning = channel_only_conditioning
         self.krylov_degree = krylov_degree
         self.forward_iterates = forward_iterates
         
         assert not (self.first_only_conditioning and self.last_only_conditioning), "first_only_conditioning and last_only_conditioning cannot be both True."
         
-        nc = [64, 128, 256, 512]  # number of channels in the network
+        # nc = [64, 128, 256, 512]  # number of channels in the network
+        self.nc = nc
+        self.nb = nb
         self.in_channels = in_channels
         self.fact_realign = torch.nn.Parameter(torch.tensor([1.0], device=device))
 
@@ -128,55 +162,69 @@ class RAMv2(Reconstructor, Denoiser):
         self.m_head = InHead(in_channels_first, nc[0])
 
         self.m_down1 = BaseEncBlock(
-            nc[0], nc[0], img_channels=in_channels, decode_upscale=1, 
+            nc[0], nc[0], nb=self.nb, img_channels=in_channels, decode_upscale=1, 
             normalization=self.is_normalization,
             conditioning=False if self.last_only_conditioning else (self.first_only_conditioning or self.encoder_conditioning),
             conditioning_list=self.first_only_conditioning_list,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_down2 = BaseEncBlock(
-            nc[1], nc[1], img_channels=in_channels, decode_upscale=2, 
+            nc[1], nc[1], nb=self.nb, img_channels=in_channels, decode_upscale=2, 
             normalization=self.is_normalization,
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.encoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_down3 = BaseEncBlock(
-            nc[2], nc[2], img_channels=in_channels, decode_upscale=4, 
+            nc[2], nc[2], nb=self.nb, img_channels=in_channels, decode_upscale=4, 
             normalization=self.is_normalization,
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.encoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_body = BaseEncBlock(
-            nc[3], nc[3], img_channels=in_channels, decode_upscale=8, 
+            nc[3], nc[3], nb=self.nb, img_channels=in_channels, decode_upscale=8, 
             normalization=self.is_normalization,
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_up3 = BaseEncBlock(
-            nc[2], nc[2], img_channels=in_channels, decode_upscale=4, 
+            nc[2], nc[2], nb=self.nb, img_channels=in_channels, decode_upscale=4, 
             normalization=self.is_normalization,
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_up2 = BaseEncBlock(
-            nc[1], nc[1], img_channels=in_channels, decode_upscale=2, 
+            nc[1], nc[1], nb=self.nb, img_channels=in_channels, decode_upscale=2, 
             normalization=self.is_normalization,
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
         self.m_up1 = BaseEncBlock(
-            nc[0], nc[0], img_channels=in_channels, decode_upscale=1, 
+            nc[0], nc[0], nb=self.nb, img_channels=in_channels, decode_upscale=1, 
             normalization=self.is_normalization,
             conditioning=False if self.first_only_conditioning else (self.decoder_conditioning or self.last_only_conditioning),
             conditioning_list=self.last_only_conditioning_list,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_norm=self.use_scale_shift_norm,
+            channel_only_conditioning=self.channel_only_conditioning
         )
 
         self.pool1 = downsample_strideconv(nc[0], nc[1], bias=False, mode="2")
@@ -434,7 +482,7 @@ class RAMv2(Reconstructor, Denoiser):
         
         return out
 
-    def forward(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True):
+    def forward(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
         r"""
         Reconstructs a signal estimate from measurements y
 
@@ -464,7 +512,7 @@ class RAMv2(Reconstructor, Denoiser):
             use_pad = pre_dict["use_pad"]
             rescale_val = pre_dict["rescale_val"]
         else:
-            x_in = y
+            assert x_in is not None, "x_in should be provided if pre_forward is False."
 
         out = self.forward_unet(x_in, sigma=sigma, gain=gain, physics=physics, y=y, cond=cond)
 
@@ -555,6 +603,8 @@ class BaseEncBlock(nn.Module):
         conditioning_list=None,
         krylov_degree=2, # number of krylov iterations, if 1 
         z_embedding_dim=0,
+        use_scale_shift_norm=False,
+        channel_only_conditioning=False
         
     ):
         super(BaseEncBlock, self).__init__()
@@ -564,6 +614,8 @@ class BaseEncBlock(nn.Module):
         self.conditioning = conditioning_list if conditioning_list is not None else [conditioning] * nb
         self.krylov_degree = krylov_degree
         self.z_embedding_dim = z_embedding_dim
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.channel_only_conditioning = channel_only_conditioning
         
         self.enc = nn.ModuleList(
             [
@@ -577,6 +629,8 @@ class BaseEncBlock(nn.Module):
                     conditioning=self.conditioning[k],
                     N=self.krylov_degree,
                     z_embedding_dim=z_embedding_dim,
+                    use_scale_shift_norm=self.use_scale_shift_norm,
+                    channel_only_conditioning=self.channel_only_conditioning
                 )
                 for k in range(nb)
             ]
@@ -738,6 +792,8 @@ class ResBlock(nn.Module):
         normalization=False,
         conditioning=True,
         z_embedding_dim=0,
+        use_scale_shift_norm=False,
+        channel_only_conditioning=False
     ):
         super(ResBlock, self).__init__()
 
@@ -795,12 +851,33 @@ class ResBlock(nn.Module):
             )
             
         if self.z_embedding_dim > 0:
-            self.cs_embedding = CSEmbedding(
-                z_dim=self.z_embedding_dim,
-                embed_dim=out_channels,
-                activation="ReLU",
-                kernel_size=3
+            # NOTE In diffusion for timestep embedding, layer is usually smaller
+            # though it's only channel-wise addition, so conditioning signal is weaker
+            # self.emb_layers = nn.Sequential(
+            #     nn.SiLU(),
+            #     nn.Linear(
+            #         emb_channels,
+            #         2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            #     ),
+            # )
+            
+            # FIXME, legacy for first experiments, with CSEmbedStem k=7
+            # self.cs_embedding = CSEmbedding(
+            #     z_dim=self.z_embedding_dim,
+            #     embed_dim=out_channels,
+            #     activation="ReLU",
+            #     kernel_size=3
+            # )
+            self.use_scale_shift_norm = use_scale_shift_norm
+            self.channel_only_conditioning = channel_only_conditioning
+            self.cs_embedding = LayerEmbedding(
+                in_channels=self.z_embedding_dim,
+                out_channels=out_channels,
+                kernel_size=3,
+                bias=False,
+                use_scale_shift_norm=use_scale_shift_norm
             )
+
 
     def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
         r"""
@@ -824,7 +901,13 @@ class ResBlock(nn.Module):
                 z, size=u_2.shape[2:], mode="bilinear", align_corners=False
             )
             z_emb = self.cs_embedding(z_resized)
-            u_2 = u_2 + z_emb
+            if self.channel_only_conditioning:
+                z_emb = z_emb.mean(dim=[2, 3], keepdim=True)
+            if self.use_scale_shift_norm:
+                scale, shift = z_emb.chunk(2, dim=1)
+                u_2 = u_2 * (1 + scale) + shift
+            else:
+                u_2 = u_2 + z_emb
         
         if self.conditioning:
             emb_grad = self.PhysicsBlock(
@@ -1091,6 +1174,7 @@ class HeadBlock(torch.nn.Module):
 
         c = out_channels if depth < 2 else in_channels
 
+        # NOTE: c=in_channels, because default is depth=2
         self.convin = torch.nn.Conv2d(
             in_channels, c, kernel_size, padding=padding, bias=bias
         )
@@ -1098,8 +1182,8 @@ class HeadBlock(torch.nn.Module):
         self.depth = depth
         self.nl_1 = torch.nn.ReLU(inplace=False)
         self.nl_2 = torch.nn.ReLU(inplace=False)
-        self.relu_in = relu_in
-        self.skip_in = skip_in
+        self.relu_in = relu_in # default is False
+        self.skip_in = skip_in # default is True
 
         for i in range(depth - 1):
             if i < depth - 2:
@@ -1121,9 +1205,9 @@ class HeadBlock(torch.nn.Module):
 
     def forward(self, x):
 
-        if self.skip_in and self.relu_in:
+        if self.skip_in and self.relu_in: # default is False
             x = self.nl_1(self.convin(x)) + self.zero_conv_skip(x)
-        elif self.skip_in and not self.relu_in:
+        elif self.skip_in and not self.relu_in: # default is True
             x = self.convin(x) + self.zero_conv_skip(x)
         else:
             x = self.convin(x)

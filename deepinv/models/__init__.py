@@ -41,3 +41,4 @@ from .client import Client
 from .wrapper import DiffusersDenoiserWrapper, ComplexDenoiserWrapper
 from .poisson2sparse import ConvLista, Poisson2Sparse
 from .ram_v2 import RAMv2
+from .jit import JiT

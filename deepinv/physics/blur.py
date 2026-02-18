@@ -67,6 +67,7 @@ class Downsampling(LinearPhysics):
         factor: int = 2,
         device: torch.device | str = "cpu",
         padding: str = "circular",
+        normalize: bool = False,
         **kwargs,
     ):
         if filter == "warn":
@@ -79,6 +80,7 @@ class Downsampling(LinearPhysics):
         self.imsize = tuple(img_size) if isinstance(img_size, list) else img_size
         self.imsize_dynamic = (3, 128, 128)  # placeholder
         self.padding = padding
+        self.normalize = normalize
         self.device = device
 
         self.register_buffer("filter", None)
@@ -112,6 +114,9 @@ class Downsampling(LinearPhysics):
             x = conv2d(x, self.filter, padding=self.padding)
 
         x = x[:, :, :: self.factor, :: self.factor]  # downsample
+
+        if self.normalize:
+            x = x * self.factor # conserves energy
 
         return x
 
@@ -163,6 +168,9 @@ class Downsampling(LinearPhysics):
             x = conv_transpose2d(
                 x, self.filter, padding=self.padding
             )  # Note: this may be slow against x = conv_transpose2d_fft(x, self.filter) in the case of circular padding
+
+        if self.normalize:
+            x = x * self.factor
 
         return x
 

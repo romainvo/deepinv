@@ -41,6 +41,7 @@ class Decolorize(DecomposablePhysics):
         self,
         channels: int = 3,
         srf: str | tuple | list = "rec601",
+        normalize: bool = False,
         device: torch.device | str = "cpu",
         **kwargs,
     ):
@@ -70,13 +71,20 @@ class Decolorize(DecomposablePhysics):
         self.register_buffer(
             "mask", torch.linalg.vector_norm(self.srf, dim=1, keepdim=True)
         )
+        self.normalize = normalize
         self.to(device)
 
     def V_adjoint(self, x: torch.Tensor) -> torch.Tensor:
         if x.shape[1] != self.srf.shape[1]:
             raise ValueError("x should have same number of channels as SRF.")
 
-        return torch.sum(x * self.srf / self.mask, dim=1, keepdim=True)
+        if self.normalize:
+            operator_norm = (self.srf ** 2).sum().sqrt()
+            factor = 1 / operator_norm
+            return factor * torch.sum(x * self.srf / self.mask, dim=1, keepdim=True)
+            
+        else:
+            return torch.sum(x * self.srf / self.mask, dim=1, keepdim=True)
 
     def V(self, y: torch.Tensor) -> torch.Tensor:
         if y.shape[1] != 1:
@@ -84,6 +92,13 @@ class Decolorize(DecomposablePhysics):
                 "y should be grayscale i.e. have length 1 in the 1st dimension."
             )
 
-        return (
-            y.expand(y.shape[0], self.srf.shape[1], *y.shape[2:]) * self.srf / self.mask
-        )
+        if self.normalize:
+            operator_norm = (self.srf ** 2).sum().sqrt()
+            factor = 1 / operator_norm
+            return factor * (
+                y.expand(y.shape[0], self.srf.shape[1], *y.shape[2:]) * self.srf / self.mask
+            )
+        else:
+            return (
+                y.expand(y.shape[0], self.srf.shape[1], *y.shape[2:]) * self.srf / self.mask
+            )
