@@ -209,8 +209,9 @@ class GeneratorMixture(PhysicsGenerator):
         generators: list[PhysicsGenerator],
         probs: list[float],
         rng: torch.Generator = None,
+        device: str | torch.device = "cpu",
     ) -> None:
-        super().__init__(rng=rng)
+        super().__init__(rng=rng, device=device)
         probs = torch.tensor(probs)
         assert torch.sum(probs) == 1, "The sum of the probabilities must be 1."
         self.generators = generators
@@ -226,6 +227,6 @@ class GeneratorMixture(PhysicsGenerator):
         :param int seed: the seed for the random number generator.
         :returns: A dictionary with the new parameters, ie ``{param_name: param_value}``.
         """
-        p = torch.rand(1, generator=self.rng).item()  # np.random.uniform()
+        p = torch.rand(1, generator=self.rng, device=self.rng.device).item()  # np.random.uniform()
         idx = torch.searchsorted(self.cum_probs, p)
         return self.generators[idx].step(batch_size, seed, **kwargs)
