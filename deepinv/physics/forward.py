@@ -1,4 +1,5 @@
 from __future__ import annotations
+import math
 from typing import Callable
 import warnings
 import copy
@@ -1317,7 +1318,7 @@ class StackedPhysics(Physics):
     :param list[deepinv.physics.Physics] physics_list: list of physics operators to stack.
     """
 
-    def __init__(self, physics_list: list[Physics], **kwargs):
+    def __init__(self, physics_list: list[Physics], normalize: bool = False, **kwargs):
         super(StackedPhysics, self).__init__()
 
         self.physics_list = []
@@ -1327,6 +1328,8 @@ class StackedPhysics(Physics):
                 if not isinstance(physics, StackedPhysics)
                 else physics.physics_list
             )
+            
+        self.normalize = normalize
 
     def A(self, x: Tensor, **kwargs) -> TensorList:
         r"""
@@ -1339,7 +1342,13 @@ class StackedPhysics(Physics):
         :param torch.Tensor x: signal/image
         :return: measurements
         """
-        return TensorList([physics.A(x, **kwargs) for physics in self.physics_list])
+        
+        if self.normalize:
+            operator_norm = len(self.physics_list) # assumes stacked operators are already normalized
+            factor = 1 / math.sqrt(operator_norm)
+            return TensorList([physics.A(x, **kwargs) for physics in self.physics_list]) * factor
+        else:
+            return TensorList([physics.A(x, **kwargs) for physics in self.physics_list])
 
     def __str__(self):
         return "StackedPhysics(" + "\n".join([f"{p}" for p in self.physics_list]) + ")"
@@ -1418,8 +1427,8 @@ class StackedLinearPhysics(StackedPhysics, LinearPhysics):
         adjoint output. Choose between ``sum``, ``mean`` or ``None``.
     """
 
-    def __init__(self, physics_list, reduction="sum", **kwargs):
-        super(StackedLinearPhysics, self).__init__(physics_list, **kwargs)
+    def __init__(self, physics_list, reduction="sum", normalize: bool = False, **kwargs):
+        super(StackedLinearPhysics, self).__init__(physics_list, normalize=normalize, **kwargs)
         if reduction == "sum":
             self.reduction = sum
         elif reduction == "mean":
@@ -1439,9 +1448,21 @@ class StackedLinearPhysics(StackedPhysics, LinearPhysics):
 
         :param deepinv.utils.TensorList y: measurements
         """
-        return self.reduction(
-            [
-                physics.A_adjoint(y[i], **kwargs)
-                for i, physics in enumerate(self.physics_list)
-            ]
-        )
+        
+        if self.normalize:
+            operator_norm = len(self.physics_list) # assumes stacked operators are already normalized
+            factor = 1 / math.sqrt(operator_norm)
+            
+            return factor * self.reduction(
+                [
+                    physics.A_adjoint(y[i], **kwargs)
+                    for i, physics in enumerate(self.physics_list)
+                ]
+            )
+        else:
+            return self.reduction(
+                [
+                    physics.A_adjoint(y[i], **kwargs)
+                    for i, physics in enumerate(self.physics_list)
+                ]
+            )
