@@ -10,29 +10,59 @@ from deepinv.utils.tensorlist import TensorList
 from deepinv.models.base import Reconstructor, Denoiser
 from deepinv.models.utils import LayerNorm_AF2d
 
+import timm
+
 class CSEmbedding(nn.Module):
     # old kernel size was 7 (not parametrizable for the moment, k=3 breaks dependency with first checkpoints)
     # embed dim was not set as kwarg, default to 64 for low complexity
-    def __init__(self, z_dim: int, embed_dim: int=64, kernel_size=3, activation: str = "SiLU"):
+    def __init__(self, z_dim: int, embed_dim: int=64, kernel_size=3, activation: str = "SiLU", deep_embedding: bool=False):
         super(CSEmbedding, self).__init__()
-        self.linear1 = nn.Conv2d(z_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
-        self.act = getattr(nn, activation)()
-        self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
+        
+        self.deep_embedding = deep_embedding
+        
+        if not self.deep_embedding:
+            self.linear1 = nn.Conv2d(z_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
+            self.act = getattr(nn, activation)()
+            self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
+            
+        else:
+            self.net = timm.create_model('resnet10t', in_chans=z_dim, pretrained=False)
+            self.linear = nn.Conv2d(512, embed_dim, kernel_size=1, bias=False)
         
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = self.linear1(z)
-        z = self.act(z)
-        z = self.linear2(z)
+        if self.deep_embedding:
+            z = self.net.forward_features(z) # returns [B,512,4,4] for 128x128 inputs
+            z = torch.mean(z, dim=[2,3], keepdim=True) # global average pooling to get [B,512,1,1]
+            z = self.linear(z) # project to embed_dim, get [B,embed_dim,1,1]
+        else:
+            z = self.linear1(z)
+            z = self.act(z)
+            z = self.linear2(z)
         return z
+
+class RMSNorm2d(nn.Module):
+    def __init__(self, num_features, eps=1e-6):
+        super(RMSNorm2d, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(num_features))
     
+    def forward(self, x):
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(dim=1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.eps)
+
+        return (self.weight.view(1, -1, 1, 1) * x).to(input_dtype)
+
 class LayerEmbedding(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, kernel_size: int = 3, bias: bool = False, use_scale_shift_norm: bool=False):
         super(LayerEmbedding, self).__init__()
         
+        self.use_scale_shift_norm = use_scale_shift_norm
         out_channels = 2 * out_channels if use_scale_shift_norm else out_channels
         
         self.linear_in = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=bias)
-        
         self.skip = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=bias)
         self.linear1 = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, padding=kernel_size//2, bias=bias)
         self.act1 = nn.ReLU(inplace=False)
@@ -103,7 +133,10 @@ class RAMv2(Reconstructor, Denoiser):
         conditioning_dim=0,
         z_embedding_dim=0,
         use_scale_shift_norm=False,
+        use_scale_norm=False,
         channel_only_conditioning=False, # if True, only use channel-wise conditioning (no spatial conditioning), only for the measurement conditioning part
+        cross_attention_conditioning=False, # if True, use cross attention for the conditioning instead of concatenation (only for the measurement conditioning part)
+        deep_embedding=False, # if True, use a deeper embedding network for the conditioning (only for the measurement conditioning part)
         krylov_degree=2,
         forward_iterates=False,
         nc: tuple[int,int,int,int] = (64, 128, 256, 512),
@@ -126,8 +159,12 @@ class RAMv2(Reconstructor, Denoiser):
             
         self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
+        assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.use_scale_norm = use_scale_norm
         self.channel_only_conditioning = channel_only_conditioning
+        self.cross_attention_conditioning = cross_attention_conditioning
+        self.deep_embedding = deep_embedding
         self.krylov_degree = krylov_degree
         self.forward_iterates = forward_iterates
         
@@ -156,6 +193,7 @@ class RAMv2(Reconstructor, Denoiser):
             z_dim=conditioning_dim,
             embed_dim=self.z_embedding_dim,
             activation="ReLU",
+            deep_embedding=self.deep_embedding
         ) if self.z_embedding_dim > 0 else None
 
         # check if in_channels is a list
@@ -169,7 +207,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_down2 = BaseEncBlock(
             nc[1], nc[1], nb=self.nb, img_channels=in_channels, decode_upscale=2, 
@@ -178,7 +219,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_down3 = BaseEncBlock(
             nc[2], nc[2], nb=self.nb, img_channels=in_channels, decode_upscale=4, 
@@ -187,7 +231,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_body = BaseEncBlock(
             nc[3], nc[3], nb=self.nb, img_channels=in_channels, decode_upscale=8, 
@@ -196,7 +243,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_up3 = BaseEncBlock(
             nc[2], nc[2], nb=self.nb, img_channels=in_channels, decode_upscale=4, 
@@ -205,7 +255,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_up2 = BaseEncBlock(
             nc[1], nc[1], nb=self.nb, img_channels=in_channels, decode_upscale=2, 
@@ -214,7 +267,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
         self.m_up1 = BaseEncBlock(
             nc[0], nc[0], nb=self.nb, img_channels=in_channels, decode_upscale=1, 
@@ -224,7 +280,10 @@ class RAMv2(Reconstructor, Denoiser):
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
             use_scale_shift_norm=self.use_scale_shift_norm,
-            channel_only_conditioning=self.channel_only_conditioning
+            use_scale_norm=self.use_scale_norm,
+            channel_only_conditioning=self.channel_only_conditioning,
+            cross_attention_conditioning=self.cross_attention_conditioning,
+            deep_embedding=self.deep_embedding
         )
 
         self.pool1 = downsample_strideconv(nc[0], nc[1], bias=False, mode="2")
@@ -604,7 +663,10 @@ class BaseEncBlock(nn.Module):
         krylov_degree=2, # number of krylov iterations, if 1 
         z_embedding_dim=0,
         use_scale_shift_norm=False,
-        channel_only_conditioning=False
+        use_scale_norm=False,
+        channel_only_conditioning=False,
+        cross_attention_conditioning=False,
+        deep_embedding=False
         
     ):
         super(BaseEncBlock, self).__init__()
@@ -614,8 +676,12 @@ class BaseEncBlock(nn.Module):
         self.conditioning = conditioning_list if conditioning_list is not None else [conditioning] * nb
         self.krylov_degree = krylov_degree
         self.z_embedding_dim = z_embedding_dim
+        assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
         self.use_scale_shift_norm = use_scale_shift_norm
+        self.use_scale_norm = use_scale_norm
         self.channel_only_conditioning = channel_only_conditioning
+        self.cross_attention_conditioning = cross_attention_conditioning
+        self.deep_embedding = deep_embedding
         
         self.enc = nn.ModuleList(
             [
@@ -630,7 +696,10 @@ class BaseEncBlock(nn.Module):
                     N=self.krylov_degree,
                     z_embedding_dim=z_embedding_dim,
                     use_scale_shift_norm=self.use_scale_shift_norm,
-                    channel_only_conditioning=self.channel_only_conditioning
+                    use_scale_norm=self.use_scale_norm,
+                    channel_only_conditioning=self.channel_only_conditioning,
+                    cross_attention_conditioning=self.cross_attention_conditioning,
+                    deep_embedding=self.deep_embedding
                 )
                 for k in range(nb)
             ]
@@ -754,6 +823,53 @@ class MeasCondBlock(nn.Module):
         emb = self.relu_encoding(cond)
         return emb
 
+from deepinv.models.jit import RMSNorm, SwiGLUFFN
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, q_channels, kv_channels, out_channels=None):
+        super(CrossAttentionBlock, self).__init__()
+        self.q_channels = q_channels
+        self.kv_channels = kv_channels
+        self.out_channels = out_channels if out_channels is not None else q_channels
+        
+        self.q_norm = RMSNorm(self.q_channels)
+        self.kv_norm = RMSNorm(self.kv_channels)
+        
+        self.q_proj = nn.Linear(self.q_channels, self.out_channels, bias=True)
+        self.k_proj = nn.Linear(self.kv_channels, self.out_channels, bias=True)
+        self.v_proj = nn.Linear(self.kv_channels, self.out_channels, bias=True)
+        
+        self.proj = nn.Linear(self.out_channels, self.out_channels, bias=True)
+        
+        # self.mlp_norm = RMSNorm(self.out_channels)
+        # self.mlp = SwiGLUFFN(self.out_channels, self.out_channels, bias=True)
+        
+    def forward(self, x, context):
+        # Reshape context to (B, C)
+        context = context.mean(dim=[2, 3])  # Reduce spatial dimensions to (B, C)
+        context = self.kv_norm(context)  # Normalize context
+
+        # Project Q, K, V
+        query = self.q_proj(self.q_norm(x.flatten(2).permute(0, 2, 1)))  # Shape: (B, H*W, C)
+        key = self.k_proj(context)  # Shape: (B, C)
+        value = self.v_proj(context)  # Shape: (B, C)
+        
+        # key = key.unsqueeze(1)  # Shape: (B, 1, C)
+        # value = value.unsqueeze(1)  # Shape: (B, 1, C)
+
+        # Compute attention weights
+        attn_weights = torch.softmax(
+            torch.einsum("bqc,bc->bq", query, key) / (key.size(-1) ** 0.5),
+            dim=-1
+        )  # Shape: (B, H*W, 1)
+
+        # Apply attention
+        attn_output = torch.einsum("bq,bc->bqc", attn_weights, value)  # Shape: (B, H*W, C)
+        attn_output = self.proj(attn_output)  # Shape: (B, H*W, C)
+        attn_output = torch.nn.functional.silu(attn_output)  # Non-linearity
+        attn_output = attn_output.permute(0, 2, 1).view_as(x)  # Reshape back to (B, C, H, W)
+
+        return attn_output
 
 class ResBlock(nn.Module):
     r"""
@@ -793,7 +909,10 @@ class ResBlock(nn.Module):
         conditioning=True,
         z_embedding_dim=0,
         use_scale_shift_norm=False,
-        channel_only_conditioning=False
+        use_scale_norm=False,
+        channel_only_conditioning=False,
+        cross_attention_conditioning=False,
+        deep_embedding=False
     ):
         super(ResBlock, self).__init__()
 
@@ -868,16 +987,46 @@ class ResBlock(nn.Module):
             #     activation="ReLU",
             #     kernel_size=3
             # )
+            assert not (use_scale_shift_norm and use_scale_norm), "use_scale_shift_norm and use_scale_norm cannot be both True."
             self.use_scale_shift_norm = use_scale_shift_norm
+            self.use_scale_norm = use_scale_norm
             self.channel_only_conditioning = channel_only_conditioning
-            self.cs_embedding = LayerEmbedding(
-                in_channels=self.z_embedding_dim,
-                out_channels=out_channels,
-                kernel_size=3,
-                bias=False,
-                use_scale_shift_norm=use_scale_shift_norm
-            )
-
+            self.deep_embedding = deep_embedding
+            self.cross_attention_conditioning = cross_attention_conditioning
+            
+            if self.cross_attention_conditioning:
+                self.cross_attention = CrossAttentionBlock(
+                    q_channels=out_channels,
+                    kv_channels=z_embedding_dim,
+                    out_channels=out_channels
+                )
+                
+                # self.mlp_norm = RMSNorm(out_channels)
+                # self.mlp = SwiGLUFFN(out_channels, out_channels * 4, bias=True)
+            else:
+                self.cs_norm = RMSNorm2d(self.z_embedding_dim)
+                if self.deep_embedding:
+                    # self.cs_norm = RMSNorm2d(self.z_embedding_dim)
+                    self.cs_embedding = nn.Sequential(
+                        nn.SiLU(),
+                        nn.Conv2d(
+                        in_channels=self.z_embedding_dim,
+                        out_channels=out_channels * 2 if use_scale_shift_norm else out_channels,
+                        kernel_size=1,
+                        bias=False
+                        )
+                    )
+                    # for logging purposes
+                    self.cs_embedding.use_scale_shift_norm = use_scale_shift_norm
+                    self.cs_embedding.use_scale_norm = use_scale_norm
+                else: 
+                    self.cs_embedding = LayerEmbedding(
+                        in_channels=self.z_embedding_dim,
+                        out_channels=out_channels,
+                        kernel_size=3 if not self.deep_embedding else 1,
+                        bias=False,
+                        use_scale_shift_norm=use_scale_shift_norm
+                    )
 
     def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
         r"""
@@ -896,18 +1045,40 @@ class ResBlock(nn.Module):
         u = self.nl(u)
         u_2 = self.conv2(u)
         
-        if self.z_embedding_dim > 0 and z is not None:
-            z_resized = nn.functional.interpolate(
-                z, size=u_2.shape[2:], mode="bilinear", align_corners=False
-            )
-            z_emb = self.cs_embedding(z_resized)
-            if self.channel_only_conditioning:
-                z_emb = z_emb.mean(dim=[2, 3], keepdim=True)
-            if self.use_scale_shift_norm:
-                scale, shift = z_emb.chunk(2, dim=1)
-                u_2 = u_2 * (1 + scale) + shift
+        if self.z_embedding_dim > 0 and z is not None:            
+            if self.cross_attention_conditioning:
+                # u_2 = u_2 + self.cross_attention(u_2, z)
+                u_2 = u_2 + self.cross_attention(u_2, z)
+                # u_2 = u_2 \
+                #     + self.mlp(
+                #         self.mlp_norm(
+                #             u_2.flatten(2).permute(0, 2, 1)
+                #         )
+                #     ).permute(0, 2, 1).view_as(u_2)
+                
             else:
-                u_2 = u_2 + z_emb
+                if self.deep_embedding:
+                    z_emb = self.cs_embedding(self.cs_norm(z))
+                else:
+                    if z.shape[2] == 1 and z.shape[3] == 1:
+                        z_emb = self.cs_embedding(self.cs_norm(z))
+                    else:
+                        z_resized = nn.functional.interpolate(
+                            z, size=u_2.shape[2:], mode="bilinear", align_corners=False
+                        )
+                        z_emb = self.cs_embedding(z_resized)
+                        
+                if self.channel_only_conditioning:
+                    z_emb = z_emb.mean(dim=[2, 3], keepdim=True)
+                
+                if self.use_scale_shift_norm:
+                    scale, shift = z_emb.chunk(2, dim=1)
+                    u_2 = u_2 * (1 + scale) + shift
+                elif self.use_scale_norm:
+                    scale = z_emb
+                    u_2 = u_2 * (1 + scale)
+                else:
+                    u_2 = u_2 + z_emb
         
         if self.conditioning:
             emb_grad = self.PhysicsBlock(
