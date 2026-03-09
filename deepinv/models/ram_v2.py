@@ -12,6 +12,15 @@ from deepinv.models.utils import LayerNorm_AF2d
 
 import timm
 
+def modulate(x, scale=None, shift=None, gate=None):
+    if scale is not None:
+        x = x * scale
+    if shift is not None:
+        x = x + shift
+    if gate is not None:
+        x = x * gate
+    return x
+
 class CSEmbedding(nn.Module):
     # old kernel size was 7 (not parametrizable for the moment, k=3 breaks dependency with first checkpoints)
     # embed dim was not set as kwarg, default to 64 for low complexity
@@ -581,6 +590,79 @@ class RAMv2(Reconstructor, Denoiser):
         out = out * rescale_val.view([out.shape[0]] + [1] * (out.ndim - 1))
 
         return out
+    
+    def forward_encoder(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
+        
+        if pre_forward:
+            pre_dict = self.pre_forward(
+                y, physics=physics, sigma=sigma, gain=gain, img_size=img_size
+            )
+            x_in = pre_dict["x_in"]
+            y = pre_dict["y"]
+            sigma = pre_dict["sigma"]
+            gain = pre_dict["gain"]
+            physics = pre_dict["physics"]
+            use_pad = pre_dict["use_pad"]
+            rescale_val = pre_dict["rescale_val"]
+        else:
+            assert x_in is not None, "x_in should be provided if pre_forward is False."
+
+
+        x0 = x_in
+
+        img_channels = x0.shape[1]
+        physics = LinearPhysicsMultiScaler(physics, x0.shape[-3:], device=x0.device)
+
+        y_list = []
+        for scale in [0, 1, 2, 3]:
+            factor = 2**scale
+            physics.set_scale(scale)
+            y_list.append(
+                krylov_embeddings(
+                    physics.downsample(x0, scale=scale), physics, factor, N=self.krylov_degree
+                )
+            )
+
+        physics.set_scale(0)
+
+        if self.separate_head and img_channels not in self.in_channels:
+            raise ValueError(
+                f"Input image has {img_channels} channels, but the network only has heads for {self.in_channels} channels."
+            )
+
+        if y is not None:
+            x0 = self.realign_input(x0, physics, y, sigma)
+
+        x0 = self.base_conditioning(x0, sigma, gain)
+
+        if cond is not None and self.conditioning_dim > 0:
+            x0 = torch.cat((x0, cond), dim=1)
+            
+        if cond is not None and self.cs_embedding is not None:
+            cond = self.cs_embedding(cond)
+
+        x1 = self.m_head(x0)
+
+        x1_ = self.m_down1(
+            x1, physics=physics, y=y_list[0], img_channels=img_channels, scale=0, z=cond
+        )
+        x2 = self.pool1(x1_)
+
+        x3_ = self.m_down2(
+            x2, physics=physics, y=y_list[1], img_channels=img_channels, scale=1, z=cond
+        )
+        x3 = self.pool2(x3_)
+
+        x4_ = self.m_down3(
+            x3, physics=physics, y=y_list[2], img_channels=img_channels, scale=2, z=cond
+        )
+        x4 = self.pool3(x4_)
+
+        x = self.m_body(
+            x4, physics=physics, y=y_list[3], img_channels=img_channels, scale=3, z=cond
+        )
+        
+        return x
 
     def obtain_sigma_gain(self, physics, sigma, gain, rescale_val, device="cpu"):
         r"""
@@ -954,7 +1036,9 @@ class ResBlock(nn.Module):
             )
 
             if self.is_normalization:
-                self.normalization = LayerNorm_AF2d(out_channels)
+                # self.normalization = LayerNorm_AF2d(out_channels)
+                self.norm1 = RMSNorm2d(out_channels)
+                self.norm2 = RMSNorm2d(out_channels)
         
         self.gain = None
         self.PhysicsBlock = None
@@ -1004,14 +1088,14 @@ class ResBlock(nn.Module):
                 # self.mlp_norm = RMSNorm(out_channels)
                 # self.mlp = SwiGLUFFN(out_channels, out_channels * 4, bias=True)
             else:
-                self.cs_norm = RMSNorm2d(self.z_embedding_dim)
+                # self.cs_norm = RMSNorm2d(self.z_embedding_dim)
                 if self.deep_embedding:
                     # self.cs_norm = RMSNorm2d(self.z_embedding_dim)
                     self.cs_embedding = nn.Sequential(
                         nn.SiLU(),
                         nn.Conv2d(
                         in_channels=self.z_embedding_dim,
-                        out_channels=out_channels * 2 if use_scale_shift_norm else out_channels,
+                        out_channels=out_channels * 4 if use_scale_shift_norm else out_channels * 2,
                         kernel_size=1,
                         bias=False
                         )
@@ -1028,7 +1112,7 @@ class ResBlock(nn.Module):
                         use_scale_shift_norm=use_scale_shift_norm
                     )
 
-    def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
+    def vanilla_forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
         r"""
         Forward pass of the residual block.
 
@@ -1044,41 +1128,93 @@ class ResBlock(nn.Module):
             u = self.normalization(u)
         u = self.nl(u)
         u_2 = self.conv2(u)
+        if self.conditioning:
+            emb_grad = self.PhysicsBlock(
+                u, y, physics, img_channels=img_channels, scale=scale
+            )
+            u_1 = self.gain * emb_grad
+            return x + u_2 + u_1
+        else:
+            return x + u_2
+    
+    def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
+        r"""
+        Forward pass of the residual block.
+
+        :param torch.Tensor x: Input tensor
+        :param deepinv.physics.Physics physics: Physics
+        :param torch.Tensor y: Measurements
+        :param int img_channels: Number of input channels.
+        :param int scale: Scale factor for the encoding block.
+        """
         
-        if self.z_embedding_dim > 0 and z is not None:            
-            if self.cross_attention_conditioning:
-                # u_2 = u_2 + self.cross_attention(u_2, z)
-                u_2 = u_2 + self.cross_attention(u_2, z)
-                # u_2 = u_2 \
-                #     + self.mlp(
-                #         self.mlp_norm(
-                #             u_2.flatten(2).permute(0, 2, 1)
-                #         )
-                #     ).permute(0, 2, 1).view_as(u_2)
-                
+        scale1, shift1, scale2, shift2 = None, None, None, None
+        if self.z_embedding_dim > 0 and z is not None:
+            if self.deep_embedding:
+                z_emb = self.cs_embedding(z)
+        
+            if self.use_scale_shift_norm:
+                scale1, shift1, scale2, shift2 = z_emb.chunk(4, dim=1)
+            elif self.use_scale_norm:
+                scale1, scale2 = z_emb.chunk(2, dim=1)
             else:
-                if self.deep_embedding:
-                    z_emb = self.cs_embedding(self.cs_norm(z))
-                else:
-                    if z.shape[2] == 1 and z.shape[3] == 1:
-                        z_emb = self.cs_embedding(self.cs_norm(z))
-                    else:
-                        z_resized = nn.functional.interpolate(
-                            z, size=u_2.shape[2:], mode="bilinear", align_corners=False
-                        )
-                        z_emb = self.cs_embedding(z_resized)
-                        
-                if self.channel_only_conditioning:
-                    z_emb = z_emb.mean(dim=[2, 3], keepdim=True)
+                shift1, shift2 = z_emb.chunk(2, dim=1)
+
+            if self.is_normalization:
+                u = modulate(self.norm1(x), scale=scale1, shift=shift1)
+            else:
+                u = modulate(x, scale=scale1, shift=shift1) 
+            u = self.nl(u)
+            x = x + self.conv1(u)
+
+            # Conv -> batch -> ReLU: https://github.com/huggingface/pytorch-image-models/blob/5853f99e4dfbeb9cd83b86f10d8c352227b6a08f/timm/models/resnet.py#L132
+            if self.is_normalization:
+                u = modulate(self.norm2(x), scale=scale2, shift=shift2)
+            else:
+                u = modulate(x, scale=scale2, shift=shift2)
                 
-                if self.use_scale_shift_norm:
-                    scale, shift = z_emb.chunk(2, dim=1)
-                    u_2 = u_2 * (1 + scale) + shift
-                elif self.use_scale_norm:
-                    scale = z_emb
-                    u_2 = u_2 * (1 + scale)
-                else:
-                    u_2 = u_2 + z_emb
+            u = self.nl(u)
+            u_2 = x + self.conv2(u)
+            
+            return u_2
+        
+        else:
+            return self.vanilla_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
+        
+        # if self.z_embedding_dim > 0 and z is not None:            
+        #     if self.cross_attention_conditioning:
+        #         # u_2 = u_2 + self.cross_attention(u_2, z)
+        #         u_2 = u_2 + self.cross_attention(u_2, z)
+        #         # u_2 = u_2 \
+        #         #     + self.mlp(
+        #         #         self.mlp_norm(
+        #         #             u_2.flatten(2).permute(0, 2, 1)
+        #         #         )
+        #         #     ).permute(0, 2, 1).view_as(u_2)
+                
+        #     else:
+        #         if self.deep_embedding:
+        #             z_emb = self.cs_embedding(self.cs_norm(z))
+        #         else:
+        #             if z.shape[2] == 1 and z.shape[3] == 1:
+        #                 z_emb = self.cs_embedding(self.cs_norm(z))
+        #             else:
+        #                 z_resized = nn.functional.interpolate(
+        #                     z, size=u_2.shape[2:], mode="bilinear", align_corners=False
+        #                 )
+        #                 z_emb = self.cs_embedding(z_resized)
+                        
+        #         if self.channel_only_conditioning:
+        #             z_emb = z_emb.mean(dim=[2, 3], keepdim=True)
+                
+        #         if self.use_scale_shift_norm:
+        #             scale, shift = z_emb.chunk(2, dim=1)
+        #             u_2 = u_2 * (1 + scale) + shift
+        #         elif self.use_scale_norm:
+        #             scale = z_emb
+        #             u_2 = u_2 * (1 + scale)
+        #         else:
+        #             u_2 = u_2 + z_emb
         
         if self.conditioning:
             emb_grad = self.PhysicsBlock(
