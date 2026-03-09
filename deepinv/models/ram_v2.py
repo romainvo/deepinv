@@ -141,6 +141,7 @@ class RAMv2(Reconstructor, Denoiser):
         last_only_conditioning_list=[],
         conditioning_dim=0,
         z_embedding_dim=0,
+        use_scale_shift_gate_norm=False,
         use_scale_shift_norm=False,
         use_scale_norm=False,
         channel_only_conditioning=False, # if True, only use channel-wise conditioning (no spatial conditioning), only for the measurement conditioning part
@@ -169,6 +170,7 @@ class RAMv2(Reconstructor, Denoiser):
         self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
         assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
+        self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
         self.use_scale_shift_norm = use_scale_shift_norm
         self.use_scale_norm = use_scale_norm
         self.channel_only_conditioning = channel_only_conditioning
@@ -215,6 +217,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning_list=self.first_only_conditioning_list,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -227,6 +230,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.encoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -239,6 +243,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.encoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -251,6 +256,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -263,6 +269,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -275,6 +282,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning=False if (self.last_only_conditioning or self.first_only_conditioning) else self.decoder_conditioning,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -288,6 +296,7 @@ class RAMv2(Reconstructor, Denoiser):
             conditioning_list=self.last_only_conditioning_list,
             krylov_degree=self.krylov_degree,
             z_embedding_dim=self.z_embedding_dim,
+            use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
             use_scale_shift_norm=self.use_scale_shift_norm,
             use_scale_norm=self.use_scale_norm,
             channel_only_conditioning=self.channel_only_conditioning,
@@ -744,6 +753,7 @@ class BaseEncBlock(nn.Module):
         conditioning_list=None,
         krylov_degree=2, # number of krylov iterations, if 1 
         z_embedding_dim=0,
+        use_scale_shift_gate_norm=False,
         use_scale_shift_norm=False,
         use_scale_norm=False,
         channel_only_conditioning=False,
@@ -759,6 +769,7 @@ class BaseEncBlock(nn.Module):
         self.krylov_degree = krylov_degree
         self.z_embedding_dim = z_embedding_dim
         assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
+        self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
         self.use_scale_shift_norm = use_scale_shift_norm
         self.use_scale_norm = use_scale_norm
         self.channel_only_conditioning = channel_only_conditioning
@@ -777,6 +788,7 @@ class BaseEncBlock(nn.Module):
                     conditioning=self.conditioning[k],
                     N=self.krylov_degree,
                     z_embedding_dim=z_embedding_dim,
+                    use_scale_shift_gate_norm=self.use_scale_shift_gate_norm,
                     use_scale_shift_norm=self.use_scale_shift_norm,
                     use_scale_norm=self.use_scale_norm,
                     channel_only_conditioning=self.channel_only_conditioning,
@@ -990,6 +1002,7 @@ class ResBlock(nn.Module):
         normalization=False,
         conditioning=True,
         z_embedding_dim=0,
+        use_scale_shift_gate_norm=False,
         use_scale_shift_norm=False,
         use_scale_norm=False,
         channel_only_conditioning=False,
@@ -1037,8 +1050,9 @@ class ResBlock(nn.Module):
 
             if self.is_normalization:
                 # self.normalization = LayerNorm_AF2d(out_channels)
-                self.norm1 = RMSNorm2d(out_channels)
-                self.norm2 = RMSNorm2d(out_channels)
+                self.norm = RMSNorm2d(out_channels)
+                # self.norm1 = RMSNorm2d(out_channels)
+                # self.norm2 = RMSNorm2d(out_channels)
         
         self.gain = None
         self.PhysicsBlock = None
@@ -1072,6 +1086,7 @@ class ResBlock(nn.Module):
             #     kernel_size=3
             # )
             assert not (use_scale_shift_norm and use_scale_norm), "use_scale_shift_norm and use_scale_norm cannot be both True."
+            self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
             self.use_scale_shift_norm = use_scale_shift_norm
             self.use_scale_norm = use_scale_norm
             self.channel_only_conditioning = channel_only_conditioning
@@ -1095,12 +1110,17 @@ class ResBlock(nn.Module):
                         nn.SiLU(),
                         nn.Conv2d(
                         in_channels=self.z_embedding_dim,
-                        out_channels=out_channels * 4 if use_scale_shift_norm else out_channels * 2,
+                        # out_channels=out_channels * 4 if use_scale_shift_norm else out_channels * 2,
+                        out_channels=out_channels * 3 if use_scale_shift_gate_norm else (out_channels * 2 if use_scale_shift_norm else out_channels),
                         kernel_size=1,
-                        bias=False
+                        bias=True # only True for rozet
                         )
                     )
+                    nn.init.constant_(self.cs_embedding[-1].weight, 0)
+                    nn.init.constant_(self.cs_embedding[-1].bias, 0)
+                    
                     # for logging purposes
+                    self.cs_embedding.use_scale_shift_gate_norm = use_scale_shift_gate_norm
                     self.cs_embedding.use_scale_shift_norm = use_scale_shift_norm
                     self.cs_embedding.use_scale_norm = use_scale_norm
                 else: 
@@ -1111,6 +1131,35 @@ class ResBlock(nn.Module):
                         bias=False,
                         use_scale_shift_norm=use_scale_shift_norm
                     )
+
+    def rozet_forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
+        scale, shift, gate = None, None, None
+        if self.z_embedding_dim > 0 and z is not None:
+            if self.deep_embedding:
+                z_emb = self.cs_embedding(z)
+            else:
+                raise NotImplementedError("Only deep_embedding is implemented for now.")
+            
+            if self.use_scale_shift_gate_norm:
+                scale, shift, gate = z_emb.chunk(3, dim=1)
+            else:
+                raise NotImplementedError("Only use_scale_shift_gate_norm is implemented for now.")
+
+        u = modulate(self.norm(x), scale=scale, shift=shift, gate=None) 
+        
+        # identical to self.ffn in rozet's unet
+        u = self.conv1(u)
+        u = self.nl(u)
+        u = self.conv2(u)
+        
+        u = (x + gate * u) * torch.rsqrt(1 + gate * gate)
+        
+        # y = (a + 1) * self.norm(x) + b
+        # y = y if self.attn is None else y + self.attn(y)
+        # y = self.ffn(y)
+        # y = (x + c * y) * torch.rsqrt(1 + c * c)
+
+        return u
 
     def vanilla_forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
         r"""
@@ -1136,18 +1185,8 @@ class ResBlock(nn.Module):
             return x + u_2 + u_1
         else:
             return x + u_2
-    
-    def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
-        r"""
-        Forward pass of the residual block.
-
-        :param torch.Tensor x: Input tensor
-        :param deepinv.physics.Physics physics: Physics
-        :param torch.Tensor y: Measurements
-        :param int img_channels: Number of input channels.
-        :param int scale: Scale factor for the encoding block.
-        """
         
+    def custom_forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
         scale1, shift1, scale2, shift2 = None, None, None, None
         if self.z_embedding_dim > 0 and z is not None:
             if self.deep_embedding:
@@ -1177,6 +1216,21 @@ class ResBlock(nn.Module):
             u_2 = x + self.conv2(u)
             
             return u_2
+
+    def forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
+        r"""
+        Forward pass of the residual block.
+
+        :param torch.Tensor x: Input tensor
+        :param deepinv.physics.Physics physics: Physics
+        :param torch.Tensor y: Measurements
+        :param int img_channels: Number of input channels.
+        :param int scale: Scale factor for the encoding block.
+        """
+        
+        if self.z_embedding_dim > 0 and z is not None:
+            return self.rozet_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
+            # return self.custom_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
         
         else:
             return self.vanilla_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
