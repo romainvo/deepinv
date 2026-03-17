@@ -11,6 +11,7 @@ from deepinv.models.base import Reconstructor, Denoiser
 from deepinv.models.utils import LayerNorm_AF2d
 
 import timm
+import math
 
 def modulate(x, scale=None, shift=None, gate=None):
     if scale is not None:
@@ -29,10 +30,21 @@ class CSEmbedding(nn.Module):
         
         self.deep_embedding = deep_embedding
         
+        D = z_dim * 128**2 # FIXME
+        
         if not self.deep_embedding:
-            self.linear1 = nn.Conv2d(z_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
-            self.act = getattr(nn, activation)()
-            self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
+            b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
+            self.register_buffer('b', b, persistent=False)
+            W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+            self.register_buffer('W', W, persistent=False)
+            
+            self.linear1 = torch.nn.Linear(embed_dim, embed_dim)
+            self.act = torch.nn.SiLU()
+            self.linear2 = torch.nn.Linear(embed_dim, embed_dim)
+            
+            # self.linear1 = nn.Conv2d(z_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
+            # self.act = getattr(nn, activation)()
+            # self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
             
         else:
             self.net = timm.create_model('resnet10t', in_chans=z_dim, pretrained=False)
@@ -44,6 +56,10 @@ class CSEmbedding(nn.Module):
             z = torch.mean(z, dim=[2,3], keepdim=True) # global average pooling to get [B,512,1,1]
             z = self.linear(z) # project to embed_dim, get [B,embed_dim,1,1]
         else:
+            z = z.flatten(start_dim=1) #@ self.W
+            z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
+            z = z + self.b
+            
             z = self.linear1(z)
             z = self.act(z)
             z = self.linear2(z)
@@ -59,7 +75,7 @@ class RMSNorm2d(nn.Module):
     def forward(self, x):
         input_dtype = x.dtype
         x = x.to(torch.float32)
-        variance = x.pow(2).mean(dim=1, keepdim=True)
+        variance = x.pow(2).mean(dim=(-3,-2,-1), keepdim=True)
         x = x * torch.rsqrt(variance + self.eps)
 
         return (self.weight.view(1, -1, 1, 1) * x).to(input_dtype)
@@ -919,46 +935,68 @@ class MeasCondBlock(nn.Module):
 
 from deepinv.models.jit import RMSNorm, SwiGLUFFN
 
+
+def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(query.size(-1))
+    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
+
+    with torch.cuda.amp.autocast(enabled=False):
+        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
+    attn_weight += attn_bias
+    attn_weight = torch.softmax(attn_weight, dim=-1)
+    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
+    return attn_weight @ value
+
+
 class CrossAttentionBlock(nn.Module):
-    def __init__(self, q_channels, kv_channels, out_channels=None):
+    def __init__(self, q_channels, kv_channels, out_channels=None, qk_norm=True, qkv_bias=True, num_heads=8):
         super(CrossAttentionBlock, self).__init__()
         self.q_channels = q_channels
+        
+        self.head_dim = out_channels // num_heads
+        self.num_heads = num_heads
+        assert out_channels % num_heads == 0, "q_channels must be divisible by num_heads"
+        
         self.kv_channels = kv_channels
         self.out_channels = out_channels if out_channels is not None else q_channels
         
-        self.q_norm = RMSNorm(self.q_channels)
-        self.kv_norm = RMSNorm(self.kv_channels)
+        self.q_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
         
-        self.q_proj = nn.Linear(self.q_channels, self.out_channels, bias=True)
-        self.k_proj = nn.Linear(self.kv_channels, self.out_channels, bias=True)
-        self.v_proj = nn.Linear(self.kv_channels, self.out_channels, bias=True)
+        self.q_proj = nn.Linear(self.q_channels, self.out_channels, bias=qkv_bias)
+        self.kv_proj = nn.Linear(self.kv_channels, 2 * self.out_channels, bias=qkv_bias)  # Project K and V together for efficiency
+        # self.k_proj = nn.Linear(self.kv_channels, self.out_channels, bias=qkv_bias)
+        # self.v_proj = nn.Linear(self.kv_channels, self.out_channels, bias=qkv_bias)
         
-        self.proj = nn.Linear(self.out_channels, self.out_channels, bias=True)
+        self.proj = nn.Linear(self.out_channels, self.out_channels, bias=qkv_bias)
         
         # self.mlp_norm = RMSNorm(self.out_channels)
         # self.mlp = SwiGLUFFN(self.out_channels, self.out_channels, bias=True)
         
     def forward(self, x, context):
         # Reshape context to (B, C)
-        context = context.mean(dim=[2, 3])  # Reduce spatial dimensions to (B, C)
-        context = self.kv_norm(context)  # Normalize context
-
-        # Project Q, K, V
-        query = self.q_proj(self.q_norm(x.flatten(2).permute(0, 2, 1)))  # Shape: (B, H*W, C)
-        key = self.k_proj(context)  # Shape: (B, C)
-        value = self.v_proj(context)  # Shape: (B, C)
+        context = context.mean(dim=[2, 3])[:, None]  # Reduce spatial dimensions to (B, 1, C)
         
-        # key = key.unsqueeze(1)  # Shape: (B, 1, C)
-        # value = value.unsqueeze(1)  # Shape: (B, 1, C)
+        B,C,H,W = x.shape
+        
+        # Project Q, K, V
+        query = self.q_proj(x.flatten(2).permute(0, 2, 1))  # Shape: (B, H*W, C)
+        # key = self.k_proj(context)  # Shape: (B, C)
+        # value = self.v_proj(context)  # Shape: (B, C)
+        key_value = self.kv_proj(context)  # Shape: (B, 1, 2*C)
+        
+        # head_dim = self.out_channels // self.num_heads
+        query = query.reshape(B, H*W, self.num_heads, self.head_dim).permute(0, 2, 1, 3) # Shape: (B, num_heads, H*W, head_dim)
+        key_value = key_value.reshape(B, 1, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4) # Shape: (2, B, num_heads, 1, head_dim)
+        key, value = key_value[0], key_value[1] # Shapes: (B, num_heads, 1, head_dim)
 
         # Compute attention weights
-        attn_weights = torch.softmax(
-            torch.einsum("bqc,bc->bq", query, key) / (key.size(-1) ** 0.5),
-            dim=-1
-        )  # Shape: (B, H*W, 1)
-
-        # Apply attention
-        attn_output = torch.einsum("bq,bc->bqc", attn_weights, value)  # Shape: (B, H*W, C)
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            query, key, value, dropout_p=0.0, is_causal=False
+        )  # Shape: (B, num_heads, H*W, head_dim)
+        attn_output = attn_output.permute(0, 2, 1, 3).reshape(B, H*W, self.out_channels)  # Shape: (B, H*W, C)
+        
         attn_output = self.proj(attn_output)  # Shape: (B, H*W, C)
         attn_output = torch.nn.functional.silu(attn_output)  # Non-linearity
         attn_output = attn_output.permute(0, 2, 1).view_as(x)  # Reshape back to (B, C, H, W)
@@ -1066,7 +1104,14 @@ class ResBlock(nn.Module):
                 N=N,
                 depth_encoding=depth_encoding,
             )
-            
+    
+        assert not (use_scale_shift_norm and use_scale_norm), "use_scale_shift_norm and use_scale_norm cannot be both True."
+        self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
+        self.use_scale_shift_norm = use_scale_shift_norm
+        self.use_scale_norm = use_scale_norm
+
+        self.deep_embedding = deep_embedding
+        self.cross_attention_conditioning = cross_attention_conditioning
         if self.z_embedding_dim > 0:
             # NOTE In diffusion for timestep embedding, layer is usually smaller
             # though it's only channel-wise addition, so conditioning signal is weaker
@@ -1085,13 +1130,7 @@ class ResBlock(nn.Module):
             #     activation="ReLU",
             #     kernel_size=3
             # )
-            assert not (use_scale_shift_norm and use_scale_norm), "use_scale_shift_norm and use_scale_norm cannot be both True."
-            self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
-            self.use_scale_shift_norm = use_scale_shift_norm
-            self.use_scale_norm = use_scale_norm
             self.channel_only_conditioning = channel_only_conditioning
-            self.deep_embedding = deep_embedding
-            self.cross_attention_conditioning = cross_attention_conditioning
             
             if self.cross_attention_conditioning:
                 self.cross_attention = CrossAttentionBlock(
@@ -1107,57 +1146,110 @@ class ResBlock(nn.Module):
                 if self.deep_embedding:
                     # self.cs_norm = RMSNorm2d(self.z_embedding_dim)
                     self.cs_embedding = nn.Sequential(
+                        # nn.Conv2d(
+                        #     in_channels=self.z_embedding_dim,
+                        #     out_channels=self.z_embedding_dim,
+                        #     kernel_size=1,
+                        #     bias=True # only True for rozet
+                        # ),
                         nn.SiLU(),
                         nn.Conv2d(
                         in_channels=self.z_embedding_dim,
-                        # out_channels=out_channels * 4 if use_scale_shift_norm else out_channels * 2,
                         out_channels=out_channels * 3 if use_scale_shift_gate_norm else (out_channels * 2 if use_scale_shift_norm else out_channels),
                         kernel_size=1,
                         bias=True # only True for rozet
                         )
                     )
-                    nn.init.constant_(self.cs_embedding[-1].weight, 0)
-                    nn.init.constant_(self.cs_embedding[-1].bias, 0)
-                    
+                    # nn.init.constant_(self.cs_embedding[-1].weight, 0)
+                    # nn.init.constant_(self.cs_embedding[-1].bias, 0)
+                    self.cs_embedding[-1].weight.data.mul_(1e-2)
+                    self.cs_embedding[-1].bias.data.mul_(1e-2)
+
                     # for logging purposes
                     self.cs_embedding.use_scale_shift_gate_norm = use_scale_shift_gate_norm
                     self.cs_embedding.use_scale_shift_norm = use_scale_shift_norm
                     self.cs_embedding.use_scale_norm = use_scale_norm
                 else: 
-                    self.cs_embedding = LayerEmbedding(
-                        in_channels=self.z_embedding_dim,
-                        out_channels=out_channels,
-                        kernel_size=3 if not self.deep_embedding else 1,
-                        bias=False,
-                        use_scale_shift_norm=use_scale_shift_norm
-                    )
+                    # self.cs_embedding = LayerEmbedding(
+                    #     in_channels=self.z_embedding_dim,
+                    #     out_channels=out_channels,
+                    #     kernel_size=3 if not self.deep_embedding else 1,
+                    #     bias=False,
+                    #     use_scale_shift_norm=use_scale_shift_norm
+                    # )
+                    self.cs_embedding = nn.Sequential(
+                        nn.Linear(self.z_embedding_dim, self.z_embedding_dim),
+                        nn.SiLU(),
+                        nn.Linear(
+                            self.z_embedding_dim, 
+                            out_channels * 3 if use_scale_shift_gate_norm 
+                            else (out_channels * 2 if use_scale_shift_norm 
+                            else out_channels)
+                        ),
+                    )             
+
+                    self.cs_embedding[-1].weight.data.mul_(1e-2)
+                    self.cs_embedding[-1].bias.data.mul_(1e-2)
+
+                    # for logging purposes
+                    self.cs_embedding.use_scale_shift_gate_norm = use_scale_shift_gate_norm
+                    self.cs_embedding.use_scale_shift_norm = use_scale_shift_norm
+                    self.cs_embedding.use_scale_norm = use_scale_norm
+
+        else:
+            if self.use_scale_shift_gate_norm:
+                self.adaLN_zero = nn.Parameter(torch.randn(3, out_channels, 1, 1))
+                self.adaLN_zero.data.mul_(1e-2)
 
     def rozet_forward(self, x, physics=None, y=None, img_channels=None, scale=0, z=None):
-        scale, shift, gate = None, None, None
-        if self.z_embedding_dim > 0 and z is not None:
-            if self.deep_embedding:
-                z_emb = self.cs_embedding(z)
+        scaling, shift, gate = None, None, None
+        if self.z_embedding_dim > 0 and z is not None:            
+            if self.cross_attention_conditioning:
+                pass
             else:
-                raise NotImplementedError("Only deep_embedding is implemented for now.")
-            
+                if self.deep_embedding:
+                    z_emb = self.cs_embedding(z)
+                else:
+                    # z_emb.shape = (B, C) for linear embedding, need to unsqueeze to (B, C, 1, 1) for channel-wise addition
+                    z_emb = self.cs_embedding(z)[...,None,None]
+                    # raise NotImplementedError("Only deep_embedding is implemented for now.")
+                
+                if self.use_scale_shift_gate_norm:
+                    scaling, shift, gate = z_emb.chunk(3, dim=1)
+                elif self.use_scale_shift_norm:
+                    scaling, shift = z_emb.chunk(2, dim=1)
+                elif self.use_scale_norm:
+                    scaling = z_emb
+                else:
+                    shift = z_emb
+        else:
             if self.use_scale_shift_gate_norm:
-                scale, shift, gate = z_emb.chunk(3, dim=1)
-            else:
-                raise NotImplementedError("Only use_scale_shift_gate_norm is implemented for now.")
+                scaling, shift, gate = self.adaLN_zero.chunk(3, dim=0)
 
-        u = modulate(self.norm(x), scale=scale, shift=shift, gate=None) 
-        
+        if self.is_normalization:
+            u = modulate(self.norm(x), scale=scaling, shift=shift, gate=None)
+        else:
+            u = modulate(x, scale=scaling, shift=shift, gate=None)
+
+        if self.cross_attention_conditioning:
+            u = u + self.cross_attention(u, z)
+
         # identical to self.ffn in rozet's unet
         u = self.conv1(u)
         u = self.nl(u)
-        u = self.conv2(u)
+        u_2 = self.conv2(u)
         
-        u = (x + gate * u) * torch.rsqrt(1 + gate * gate)
+        if self.conditioning:
+            emb_grad = self.PhysicsBlock(
+                u, y, physics, img_channels=img_channels, scale=scale
+            )
+            u_1 = self.gain * emb_grad
+            return x + u_2 + u_1
         
-        # y = (a + 1) * self.norm(x) + b
-        # y = y if self.attn is None else y + self.attn(y)
-        # y = self.ffn(y)
-        # y = (x + c * y) * torch.rsqrt(1 + c * c)
+        if gate is not None:
+            u = (x + gate * u_2) * torch.rsqrt(1 + gate * gate)
+        else:
+            u = x + u_2
 
         return u
 
@@ -1231,9 +1323,9 @@ class ResBlock(nn.Module):
         if self.z_embedding_dim > 0 and z is not None:
             return self.rozet_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
             # return self.custom_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
-        
         else:
-            return self.vanilla_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
+            # return self.vanilla_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
+            return self.rozet_forward(x, physics=physics, y=y, img_channels=img_channels, scale=scale, z=z)
         
         # if self.z_embedding_dim > 0 and z is not None:            
         #     if self.cross_attention_conditioning:
