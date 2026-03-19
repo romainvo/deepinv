@@ -33,9 +33,10 @@ class CSEmbedding(nn.Module):
         D = z_dim * 128**2 # FIXME
         
         if not self.deep_embedding:
-            b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
-            self.register_buffer('b', b, persistent=False)
+            # b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
+            # self.register_buffer('b', b, persistent=False)
             W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+            W = W / math.sqrt(embed_dim) # normalize by output dimension for stability
             self.register_buffer('W', W, persistent=False)
             
             self.linear1 = torch.nn.Linear(embed_dim, embed_dim)
@@ -58,7 +59,8 @@ class CSEmbedding(nn.Module):
         else:
             z = z.flatten(start_dim=1) #@ self.W
             z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
-            z = z + self.b
+            # z = z + self.b
+            z = self.act(z)
             
             z = self.linear1(z)
             z = self.act(z)
