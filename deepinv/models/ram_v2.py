@@ -36,7 +36,7 @@ class CSEmbedding(nn.Module):
             # b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
             # self.register_buffer('b', b, persistent=False)
             W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
-            W = W / math.sqrt(embed_dim) # normalize by output dimension for stability
+            # W = W / math.sqrt(embed_dim) # normalize by output dimension for stability
             self.register_buffer('W', W, persistent=False)
             
             self.linear1 = torch.nn.Linear(embed_dim, embed_dim)
@@ -168,11 +168,13 @@ class RAMv2(Reconstructor, Denoiser):
         krylov_degree=2,
         forward_iterates=False,
         nc: tuple[int,int,int,int] = (64, 128, 256, 512),
-        nb: int = 4
+        nb: int = 4,
+        residual_learning: bool = False,
     ):
         super(RAMv2, self).__init__()
 
         # custom additions
+        self.residual_learning = residual_learning
         self.is_normalization = normalization
         self.encoder_conditioning = encoder_conditioning
         self.decoder_conditioning = decoder_conditioning
@@ -449,9 +451,11 @@ class RAMv2(Reconstructor, Denoiser):
             )
 
         if y is not None:
-            x0 = self.realign_input(x0, physics, y, sigma)
+            x0_prox = self.realign_input(x0, physics, y, sigma)
+        else:
+            x0_prox = x0
 
-        x0 = self.base_conditioning(x0, sigma, gain)
+        x0 = self.base_conditioning(x0_prox, sigma, gain)
 
         if cond is not None and self.conditioning_dim > 0:
             x0 = torch.cat((x0, cond), dim=1)
@@ -497,7 +501,10 @@ class RAMv2(Reconstructor, Denoiser):
 
         x = self.m_tail(x + x1, img_channels)
 
-        return x
+        if self.residual_learning:
+            return x0_prox + x
+        else:
+            return x
     
     def pre_forward(self, y, physics=None, sigma=None, gain=None, img_size=None):
         
