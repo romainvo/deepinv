@@ -691,7 +691,7 @@ class PoissonGaussianNoise(NoiseModel):
             # asynchronous nature. For this reason we add a manual check if the
             # RNG is on a CUDA device.
             if self.rng is not None and self.rng.device.type == "cuda":
-                assert gain > 0, "Gain must be positive"
+                assert torch.all(gain > 0), "Gain must be positive"
                 assert torch.all(x >= 0), "Input tensor must be non-negative"
 
             y = torch.poisson(x / gain, generator=self.rng) * gain

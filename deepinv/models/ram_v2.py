@@ -57,10 +57,11 @@ class CSEmbedding(nn.Module):
             z = torch.mean(z, dim=[2,3], keepdim=True) # global average pooling to get [B,512,1,1]
             z = self.linear(z) # project to embed_dim, get [B,embed_dim,1,1]
         else:
-            z = z.flatten(start_dim=1) #@ self.W
-            z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
-            # z = z + self.b
-            z = self.act(z)
+            with torch.no_grad():
+                z = z.flatten(start_dim=1) #@ self.W
+                z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
+                # z = z + self.b
+                z = self.act(z)
             
             z = self.linear1(z)
             z = self.act(z)
