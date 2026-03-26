@@ -25,19 +25,23 @@ def modulate(x, scale=None, shift=None, gate=None):
 class CSEmbedding(nn.Module):
     # old kernel size was 7 (not parametrizable for the moment, k=3 breaks dependency with first checkpoints)
     # embed dim was not set as kwarg, default to 64 for low complexity
-    def __init__(self, z_dim: int, embed_dim: int=64, kernel_size=3, activation: str = "SiLU", deep_embedding: bool=False):
+    def __init__(self, z_dim: int, embed_dim: int=64, kernel_size=3, activation: str = "SiLU", deep_embedding: bool=False, legacy: bool=False, y_embedding: bool=False):
         super(CSEmbedding, self).__init__()
         
         self.deep_embedding = deep_embedding
-        
+        self.legacy = legacy
+        self.y_embedding = y_embedding
         D = z_dim * 128**2 # FIXME
         
         if not self.deep_embedding:
-            # b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
-            # self.register_buffer('b', b, persistent=False)
-            W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
-            # W = W / math.sqrt(embed_dim) # normalize by output dimension for stability
-            self.register_buffer('W', W, persistent=False)
+            if self.legacy:
+                b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
+                self.register_buffer('b', b, persistent=False)
+                W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W', W, persistent=False)
+            else:
+                W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W', W, persistent=False)
             
             self.linear1 = torch.nn.Linear(embed_dim, embed_dim)
             self.act = torch.nn.SiLU()
@@ -47,25 +51,49 @@ class CSEmbedding(nn.Module):
             # self.act = getattr(nn, activation)()
             # self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
             
+            if self.y_embedding:
+                W_y = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(2000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W_y', W_y, persistent=False)
+                self.mlp_y = nn.Sequential(
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.SiLU(),
+                    nn.Linear(embed_dim, embed_dim)
+                )
+            
         else:
             self.net = timm.create_model('resnet10t', in_chans=z_dim, pretrained=False)
             self.linear = nn.Conv2d(512, embed_dim, kernel_size=1, bias=False)
         
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, y: torch.Tensor=None) -> torch.Tensor:
         if self.deep_embedding:
             z = self.net.forward_features(z) # returns [B,512,4,4] for 128x128 inputs
             z = torch.mean(z, dim=[2,3], keepdim=True) # global average pooling to get [B,512,1,1]
             z = self.linear(z) # project to embed_dim, get [B,embed_dim,1,1]
         else:
             with torch.no_grad():
-                z = z.flatten(start_dim=1) #@ self.W
-                z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
-                # z = z + self.b
-                z = self.act(z)
+                if self.legacy:
+                    z = z.flatten(start_dim=1) #@ self.W
+                    z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
+                    z = z + self.b
+                else:
+                    z = z.flatten(start_dim=1) #@ self.W
+                    z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
+                    # z = z + self.b
+                    z = self.act(z)
             
             z = self.linear1(z)
             z = self.act(z)
             z = self.linear2(z)
+            
+            if self.y_embedding and y is not None:
+                with torch.no_grad():
+                    y_emb = y.flatten(start_dim=1) #@ self.W_y
+                    y_emb = torch.einsum('BD,dD->Bd', y_emb, self.W_y) # [B, d]
+                    y_emb = self.act(y_emb)
+                    
+                y_emb = self.mlp_y(y_emb)
+                z = z + y_emb
+        
         return z
 
 class RMSNorm2d(nn.Module):
@@ -171,6 +199,8 @@ class RAMv2(Reconstructor, Denoiser):
         nc: tuple[int,int,int,int] = (64, 128, 256, 512),
         nb: int = 4,
         residual_learning: bool = False,
+        legacy_embedding: bool = False,
+        y_embedding: bool = False
     ):
         super(RAMv2, self).__init__()
 
@@ -188,6 +218,7 @@ class RAMv2(Reconstructor, Denoiser):
         self.last_only_conditioning_list = last_only_conditioning_list if len(last_only_conditioning_list) > 0 \
             else ([last_only_conditioning] * 4 if last_only_conditioning else None)
             
+        self.y_embedding = y_embedding
         self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
         assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
@@ -225,7 +256,9 @@ class RAMv2(Reconstructor, Denoiser):
             z_dim=conditioning_dim,
             embed_dim=self.z_embedding_dim,
             activation="ReLU",
-            deep_embedding=self.deep_embedding
+            deep_embedding=self.deep_embedding,
+            legacy=legacy_embedding,
+            y_embedding=self.y_embedding
         ) if self.z_embedding_dim > 0 else None
 
         # check if in_channels is a list
@@ -462,7 +495,9 @@ class RAMv2(Reconstructor, Denoiser):
             x0 = torch.cat((x0, cond), dim=1)
             
         if cond is not None and self.cs_embedding is not None:
-            cond = self.cs_embedding(cond)
+            cond = self.cs_embedding(
+                cond, 
+                y=physics.A_adjoint(y) if self.y_embedding else None)
 
         x1 = self.m_head(x0)
 
