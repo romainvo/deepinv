@@ -200,7 +200,8 @@ class RAMv2(Reconstructor, Denoiser):
         nb: int = 4,
         residual_learning: bool = False,
         legacy_embedding: bool = False,
-        y_embedding: bool = False
+        y_embedding: bool = False,
+        noise_conditioning: bool = False
     ):
         super(RAMv2, self).__init__()
 
@@ -218,6 +219,7 @@ class RAMv2(Reconstructor, Denoiser):
         self.last_only_conditioning_list = last_only_conditioning_list if len(last_only_conditioning_list) > 0 \
             else ([last_only_conditioning] * 4 if last_only_conditioning else None)
             
+        self.noise_conditioning = noise_conditioning
         self.y_embedding = y_embedding
         self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
@@ -246,11 +248,15 @@ class RAMv2(Reconstructor, Denoiser):
 
         if isinstance(in_channels, list):
             in_channels_first = []
-            for i in range(len(in_channels)):
+            for i in range(len(in_channels)): 
+                in_ch = in_channels[i]
                 if self.z_embedding_dim == 0:
-                    in_channels_first.append(in_channels[i] + 2 + conditioning_dim)
-                else:
-                    in_channels_first.append(in_channels[i] + 2)
+                    in_ch += conditioning_dim
+                if not self.noise_conditioning:
+                    # concat sigma and gain maps as additional channels
+                    in_ch += 2
+                    
+                in_channels_first.append(in_channels[i] + 2)
 
         self.cs_embedding = CSEmbedding(
             z_dim=conditioning_dim,
@@ -260,6 +266,13 @@ class RAMv2(Reconstructor, Denoiser):
             legacy=legacy_embedding,
             y_embedding=self.y_embedding
         ) if self.z_embedding_dim > 0 else None
+        
+        if self.noise_conditioning:
+            self.noise_embedding = nn.Sequential(
+                nn.Linear(2, self.z_embedding_dim if self.z_embedding_dim > 0 else 256),
+                nn.SiLU(),
+                nn.Linear(self.z_embedding_dim if self.z_embedding_dim > 0 else 256, self.z_embedding_dim if self.z_embedding_dim > 0 else 256)
+            )
 
         # check if in_channels is a list
         self.m_head = InHead(in_channels_first, nc[0])
@@ -489,7 +502,17 @@ class RAMv2(Reconstructor, Denoiser):
         else:
             x0_prox = x0
 
-        x0 = self.base_conditioning(x0_prox, sigma, gain)
+        # concatenate fixed maps of sigma and gain as additional channels
+        noise_cond = None
+        if not self.noise_conditioning:
+            x0 = self.base_conditioning(x0_prox, sigma, gain)
+            
+        # compute noise embedding and condition every layer with it
+        # FIXME: only works if cs_embedding is activated
+        else:
+            x0 = x0_prox
+            # noise_cond.shape = [B, z_embedding_dim]
+            noise_cond = self.noise_embedding(torch.stack((sigma, gain), dim=1))
 
         if cond is not None and self.conditioning_dim > 0:
             x0 = torch.cat((x0, cond), dim=1)
@@ -498,6 +521,9 @@ class RAMv2(Reconstructor, Denoiser):
             cond = self.cs_embedding(
                 cond, 
                 y=physics.A_adjoint(y) if self.y_embedding else None)
+            
+            if noise_cond is not None:
+                cond = cond + noise_cond
 
         x1 = self.m_head(x0)
 
