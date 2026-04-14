@@ -186,6 +186,7 @@ class RAMv2(Reconstructor, Denoiser):
         first_only_conditioning_list=[],
         last_only_conditioning=False, # if True, only the last decoder block has measurement conditioning,
         last_only_conditioning_list=[],
+        cond_in_channels=0, # additional channels to concatenate to the input (e.g. for conditioning), only for the first layer
         conditioning_dim=0,
         z_embedding_dim=0,
         use_scale_shift_gate_norm=False,
@@ -219,9 +220,12 @@ class RAMv2(Reconstructor, Denoiser):
         self.last_only_conditioning_list = last_only_conditioning_list if len(last_only_conditioning_list) > 0 \
             else ([last_only_conditioning] * 4 if last_only_conditioning else None)
             
+        self.cond_in_channels = cond_in_channels
+        # self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
+        self.conditioning_dim = conditioning_dim
+
         self.noise_conditioning = noise_conditioning
         self.y_embedding = y_embedding
-        self.conditioning_dim = conditioning_dim if z_embedding_dim == 0 else 0
         self.z_embedding_dim = z_embedding_dim
         assert not use_scale_shift_norm or not use_scale_norm, "use_scale_shift_norm and use_scale_norm cannot be both True."
         self.use_scale_shift_gate_norm = use_scale_shift_gate_norm
@@ -250,16 +254,20 @@ class RAMv2(Reconstructor, Denoiser):
             in_channels_first = []
             for i in range(len(in_channels)): 
                 in_ch = in_channels[i]
-                if self.z_embedding_dim == 0:
-                    in_ch += conditioning_dim
+
                 if not self.noise_conditioning:
                     # concat sigma and gain maps as additional channels
                     in_ch += 2
+                
+                # NOTE: replaced by in_ch += self.additional_in_channels 
+                # if self.z_embedding_dim == 0:
+                #     in_ch += conditioning_dim
+                in_ch += self.cond_in_channels    
                     
                 in_channels_first.append(in_channels[i] + 2)
 
         self.cs_embedding = CSEmbedding(
-            z_dim=conditioning_dim,
+            z_dim=self.conditioning_dim,
             embed_dim=self.z_embedding_dim,
             activation="ReLU",
             deep_embedding=self.deep_embedding,
@@ -467,7 +475,7 @@ class RAMv2(Reconstructor, Denoiser):
 
         return model_input
 
-    def forward_unet(self, x0, sigma=None, gain=None, physics=None, y=None, cond=None):
+    def forward_unet(self, x0, sigma=None, gain=None, physics=None, y=None, cond=None, input_cond=None):
         r"""
         Forward pass of the UNet model.
 
@@ -514,8 +522,8 @@ class RAMv2(Reconstructor, Denoiser):
             # noise_cond.shape = [B, z_embedding_dim]
             noise_cond = self.noise_embedding(torch.stack((sigma, gain), dim=1))
 
-        if cond is not None and self.conditioning_dim > 0:
-            x0 = torch.cat((x0, cond), dim=1)
+        if input_cond is not None and self.cond_in_channels > 0:
+            x0 = torch.cat((x0, input_cond), dim=1)
             
         if cond is not None and self.cs_embedding is not None:
             cond = self.cs_embedding(
@@ -646,7 +654,7 @@ class RAMv2(Reconstructor, Denoiser):
         
         return out
 
-    def forward(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
+    def forward(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, input_cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
         r"""
         Reconstructs a signal estimate from measurements y
 
@@ -678,7 +686,7 @@ class RAMv2(Reconstructor, Denoiser):
         else:
             assert x_in is not None, "x_in should be provided if pre_forward is False."
 
-        out = self.forward_unet(x_in, sigma=sigma, gain=gain, physics=physics, y=y, cond=cond)
+        out = self.forward_unet(x_in, sigma=sigma, gain=gain, physics=physics, y=y, cond=cond, input_cond=input_cond)
 
         if use_pad:
             out = physics.remove_pad(out)
@@ -687,78 +695,79 @@ class RAMv2(Reconstructor, Denoiser):
 
         return out
     
-    def forward_encoder(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
+    # FIXME: not up to date --> need to factorize the code so that forward_unet calls forward_encoder
+    # def forward_encoder(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
         
-        if pre_forward:
-            pre_dict = self.pre_forward(
-                y, physics=physics, sigma=sigma, gain=gain, img_size=img_size
-            )
-            x_in = pre_dict["x_in"]
-            y = pre_dict["y"]
-            sigma = pre_dict["sigma"]
-            gain = pre_dict["gain"]
-            physics = pre_dict["physics"]
-            use_pad = pre_dict["use_pad"]
-            rescale_val = pre_dict["rescale_val"]
-        else:
-            assert x_in is not None, "x_in should be provided if pre_forward is False."
+    #     if pre_forward:
+    #         pre_dict = self.pre_forward(
+    #             y, physics=physics, sigma=sigma, gain=gain, img_size=img_size
+    #         )
+    #         x_in = pre_dict["x_in"]
+    #         y = pre_dict["y"]
+    #         sigma = pre_dict["sigma"]
+    #         gain = pre_dict["gain"]
+    #         physics = pre_dict["physics"]
+    #         use_pad = pre_dict["use_pad"]
+    #         rescale_val = pre_dict["rescale_val"]
+    #     else:
+    #         assert x_in is not None, "x_in should be provided if pre_forward is False."
 
 
-        x0 = x_in
+    #     x0 = x_in
 
-        img_channels = x0.shape[1]
-        physics = LinearPhysicsMultiScaler(physics, x0.shape[-3:], device=x0.device)
+    #     img_channels = x0.shape[1]
+    #     physics = LinearPhysicsMultiScaler(physics, x0.shape[-3:], device=x0.device)
 
-        y_list = []
-        for scale in [0, 1, 2, 3]:
-            factor = 2**scale
-            physics.set_scale(scale)
-            y_list.append(
-                krylov_embeddings(
-                    physics.downsample(x0, scale=scale), physics, factor, N=self.krylov_degree
-                )
-            )
+    #     y_list = []
+    #     for scale in [0, 1, 2, 3]:
+    #         factor = 2**scale
+    #         physics.set_scale(scale)
+    #         y_list.append(
+    #             krylov_embeddings(
+    #                 physics.downsample(x0, scale=scale), physics, factor, N=self.krylov_degree
+    #             )
+    #         )
 
-        physics.set_scale(0)
+    #     physics.set_scale(0)
 
-        if self.separate_head and img_channels not in self.in_channels:
-            raise ValueError(
-                f"Input image has {img_channels} channels, but the network only has heads for {self.in_channels} channels."
-            )
+    #     if self.separate_head and img_channels not in self.in_channels:
+    #         raise ValueError(
+    #             f"Input image has {img_channels} channels, but the network only has heads for {self.in_channels} channels."
+    #         )
 
-        if y is not None:
-            x0 = self.realign_input(x0, physics, y, sigma)
+    #     if y is not None:
+    #         x0 = self.realign_input(x0, physics, y, sigma)
 
-        x0 = self.base_conditioning(x0, sigma, gain)
+    #     x0 = self.base_conditioning(x0, sigma, gain)
 
-        if cond is not None and self.conditioning_dim > 0:
-            x0 = torch.cat((x0, cond), dim=1)
+    #     if cond is not None and self.conditioning_dim > 0:
+    #         x0 = torch.cat((x0, cond), dim=1)
             
-        if cond is not None and self.cs_embedding is not None:
-            cond = self.cs_embedding(cond)
+    #     if cond is not None and self.cs_embedding is not None:
+    #         cond = self.cs_embedding(cond)
 
-        x1 = self.m_head(x0)
+    #     x1 = self.m_head(x0)
 
-        x1_ = self.m_down1(
-            x1, physics=physics, y=y_list[0], img_channels=img_channels, scale=0, z=cond
-        )
-        x2 = self.pool1(x1_)
+    #     x1_ = self.m_down1(
+    #         x1, physics=physics, y=y_list[0], img_channels=img_channels, scale=0, z=cond
+    #     )
+    #     x2 = self.pool1(x1_)
 
-        x3_ = self.m_down2(
-            x2, physics=physics, y=y_list[1], img_channels=img_channels, scale=1, z=cond
-        )
-        x3 = self.pool2(x3_)
+    #     x3_ = self.m_down2(
+    #         x2, physics=physics, y=y_list[1], img_channels=img_channels, scale=1, z=cond
+    #     )
+    #     x3 = self.pool2(x3_)
 
-        x4_ = self.m_down3(
-            x3, physics=physics, y=y_list[2], img_channels=img_channels, scale=2, z=cond
-        )
-        x4 = self.pool3(x4_)
+    #     x4_ = self.m_down3(
+    #         x3, physics=physics, y=y_list[2], img_channels=img_channels, scale=2, z=cond
+    #     )
+    #     x4 = self.pool3(x4_)
 
-        x = self.m_body(
-            x4, physics=physics, y=y_list[3], img_channels=img_channels, scale=3, z=cond
-        )
+    #     x = self.m_body(
+    #         x4, physics=physics, y=y_list[3], img_channels=img_channels, scale=3, z=cond
+    #     )
         
-        return x
+    #     return x
 
     def obtain_sigma_gain(self, physics, sigma, gain, rescale_val, device="cpu"):
         r"""
