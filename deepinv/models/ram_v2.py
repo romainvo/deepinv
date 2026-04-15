@@ -264,7 +264,7 @@ class RAMv2(Reconstructor, Denoiser):
                 #     in_ch += conditioning_dim
                 in_ch += self.cond_in_channels    
                     
-                in_channels_first.append(in_channels[i] + 2)
+                in_channels_first.append(in_ch)
 
         self.cs_embedding = CSEmbedding(
             z_dim=self.conditioning_dim,
@@ -475,7 +475,19 @@ class RAMv2(Reconstructor, Denoiser):
 
         return model_input
 
-    def forward_unet(self, x0, sigma=None, gain=None, physics=None, y=None, cond=None, input_cond=None):
+    def forward_unet(
+        self, 
+        x0, 
+        sigma=None, 
+        gain=None, 
+        physics=None, 
+        y=None, 
+        prox_init=True,
+        cond=None, 
+        input_cond=None,
+        no_bottleneck_in=False,
+        no_bottleneck_out=False,
+    ):
         r"""
         Forward pass of the UNet model.
 
@@ -485,16 +497,28 @@ class RAMv2(Reconstructor, Denoiser):
         :param deepinv.physics.Physics physics: physics measurement operator
         :param torch.Tensor y: measurements
         """
-        img_channels = x0.shape[1]
-        physics = LinearPhysicsMultiScaler(physics, x0.shape[-3:], device=x0.device)
-
+        
+        assert not (no_bottleneck_in and prox_init), "prox_init is not compatible with no_bottleneck_in, as the realignment step is performed in the ambiant domain"
+        
+        assert not (no_bottleneck_in and input_cond is not None), "input_cond is not compatible with no_bottleneck_in, as the conditioning is performed stack with the ambiant domain"
+        
+        # FIXME: calculations are always perform regardless if conditioning
+        # is activating or not...
+        with torch.no_grad():
+            AT_y = physics.A_adjoint(y) if y is not None else None
+        # img_channels = x0.shape[1]
+        # physics = LinearPhysicsMultiScaler(physics, x0.shape[-3:], device=x0.device)
+        
+        img_channels = AT_y.shape[1]
+        physics = LinearPhysicsMultiScaler(physics, AT_y.shape[-3:], device=AT_y.device)
         y_list = []
         for scale in [0, 1, 2, 3]:
             factor = 2**scale
             physics.set_scale(scale)
             y_list.append(
                 krylov_embeddings(
-                    physics.downsample(x0, scale=scale), physics, factor, N=self.krylov_degree
+                    # physics.downsample(x0, scale=scale), physics, factor, N=self.krylov_degree
+                    physics.downsample(AT_y, scale=scale), physics, factor, N=self.krylov_degree
                 )
             )
 
@@ -505,7 +529,7 @@ class RAMv2(Reconstructor, Denoiser):
                 f"Input image has {img_channels} channels, but the network only has heads for {self.in_channels} channels."
             )
 
-        if y is not None:
+        if prox_init:
             x0_prox = self.realign_input(x0, physics, y, sigma)
         else:
             x0_prox = x0
@@ -513,7 +537,13 @@ class RAMv2(Reconstructor, Denoiser):
         # concatenate fixed maps of sigma and gain as additional channels
         noise_cond = None
         if not self.noise_conditioning:
-            x0 = self.base_conditioning(x0_prox, sigma, gain)
+            
+            # skip noise maps concat if no bottleneck in
+            if no_bottleneck_in:
+                x0 = x0_prox
+                
+            else:
+                x0 = self.base_conditioning(x0_prox, sigma, gain)
             
         # compute noise embedding and condition every layer with it
         # FIXME: only works if cs_embedding is activated
@@ -533,7 +563,10 @@ class RAMv2(Reconstructor, Denoiser):
             if noise_cond is not None:
                 cond = cond + noise_cond
 
-        x1 = self.m_head(x0)
+        if no_bottleneck_in:
+            x1 = x0
+        else:
+            x1 = self.m_head(x0)
 
         x1_ = self.m_down1(
             x1, physics=physics, y=y_list[0], img_channels=img_channels, scale=0, z=cond
@@ -568,6 +601,9 @@ class RAMv2(Reconstructor, Denoiser):
         x = self.m_up1(
             x, physics=physics, y=y_list[0], img_channels=img_channels, scale=0, z=cond
         )
+
+        if no_bottleneck_out:
+            return x
 
         x = self.m_tail(x + x1, img_channels)
 
@@ -654,7 +690,23 @@ class RAMv2(Reconstructor, Denoiser):
         
         return out
 
-    def forward(self, y, physics=None, sigma=None, gain=None, img_size=None, cond=None, input_cond=None, use_pad=None, rescale_val=None, pre_forward=True, x_in=None):
+    def forward(
+        self, 
+        y, 
+        physics=None, 
+        sigma=None, 
+        gain=None, 
+        img_size=None, 
+        cond=None, 
+        input_cond=None, 
+        use_pad=None, 
+        rescale_val=None,
+        pre_forward=True, 
+        prox_init=True,
+        x_in=None, 
+        no_bottleneck_in=False, 
+        no_bottleneck_out=False,
+    ):
         r"""
         Reconstructs a signal estimate from measurements y
 
@@ -672,6 +724,8 @@ class RAMv2(Reconstructor, Denoiser):
         :return: torch.Tensor: reconstructed signal estimate
         """
 
+        if no_bottleneck_in:
+            assert not pre_forward, "pre_forward should be False when no_bottleneck is True, as the pre_forward step is not compatible with the no_bottleneck option."
         if pre_forward:
             pre_dict = self.pre_forward(
                 y, physics=physics, sigma=sigma, gain=gain, img_size=img_size
@@ -686,12 +740,23 @@ class RAMv2(Reconstructor, Denoiser):
         else:
             assert x_in is not None, "x_in should be provided if pre_forward is False."
 
-        out = self.forward_unet(x_in, sigma=sigma, gain=gain, physics=physics, y=y, cond=cond, input_cond=input_cond)
+        out = self.forward_unet(
+            x_in, 
+            sigma=sigma, 
+            gain=gain, 
+            physics=physics, 
+            y=y, 
+            prox_init=prox_init,
+            cond=cond, 
+            input_cond=input_cond,
+            no_bottleneck_in=no_bottleneck_in,
+            no_bottleneck_out=no_bottleneck_out
+        )
+        
+        if no_bottleneck_out:
+            return out
 
-        if use_pad:
-            out = physics.remove_pad(out)
-
-        out = out * rescale_val.view([out.shape[0]] + [1] * (out.ndim - 1))
+        out = self.post_forward(out, physics=physics, use_pad=use_pad, rescale_val=rescale_val)
 
         return out
     
