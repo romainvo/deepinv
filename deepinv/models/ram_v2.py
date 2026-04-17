@@ -31,17 +31,25 @@ class CSEmbedding(nn.Module):
         self.deep_embedding = deep_embedding
         self.legacy = legacy
         self.y_embedding = y_embedding
-        D = z_dim * 128**2 # FIXME
+        D_1 = 128**2 # FIXME
+        D_2 = 2*128**2 # FIXME
+        D_3 = 3*128**2 # FIXME
         
         if not self.deep_embedding:
             if self.legacy:
                 b = 2*torch.pi * torch.rand((embed_dim,), generator=torch.Generator().manual_seed(1000))
                 self.register_buffer('b', b, persistent=False)
-                W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                W = torch.randn(embed_dim, D_1, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
                 self.register_buffer('W', W, persistent=False)
             else:
-                W = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
-                self.register_buffer('W', W, persistent=False)
+                W1 = torch.randn(embed_dim, D_1, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W1', W1, persistent=False)
+                
+                W2 = torch.randn(embed_dim, D_2, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W2', W2, persistent=False)
+                
+                W3 = torch.randn(embed_dim, D_3, generator=torch.Generator().manual_seed(1000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W3', W3, persistent=False)
             
             self.linear1 = torch.nn.Linear(embed_dim, embed_dim)
             self.act = torch.nn.SiLU()
@@ -52,8 +60,12 @@ class CSEmbedding(nn.Module):
             # self.linear2 = nn.Conv2d(embed_dim, embed_dim, kernel_size=kernel_size, padding=kernel_size//2)
             
             if self.y_embedding:
-                W_y = torch.randn(embed_dim, D, generator=torch.Generator().manual_seed(2000)) # * math.sqrt(2 * gamma)
-                self.register_buffer('W_y', W_y, persistent=False)
+                W1_y = torch.randn(embed_dim, D_1, generator=torch.Generator().manual_seed(2000)) # * math.sqrt(2 * gamma)
+                W2_y = torch.randn(embed_dim, D_2, generator=torch.Generator().manual_seed(2000)) # * math.sqrt(2 * gamma)
+                W3_y = torch.randn(embed_dim, D_3, generator=torch.Generator().manual_seed(2000)) # * math.sqrt(2 * gamma)
+                self.register_buffer('W1_y', W1_y, persistent=False)
+                self.register_buffer('W2_y', W2_y, persistent=False)
+                self.register_buffer('W3_y', W3_y, persistent=False)
                 self.mlp_y = nn.Sequential(
                     nn.Linear(embed_dim, embed_dim),
                     nn.SiLU(),
@@ -76,8 +88,16 @@ class CSEmbedding(nn.Module):
                     z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
                     z = z + self.b
                 else:
+                    if z.shape[1] == 1:
+                        W = self.W1
+                    elif z.shape[1] == 2:
+                        W = self.W2
+                    elif z.shape[1] == 3:
+                        W = self.W3
+                    
                     z = z.flatten(start_dim=1) #@ self.W
-                    z = torch.einsum('BD,dD->Bd', z, self.W) # [B, d]
+                    z = torch.einsum('BD,dD->Bd', z, W) # [B, d]
+                    
                     # z = z + self.b
                     z = self.act(z)
             
@@ -87,8 +107,15 @@ class CSEmbedding(nn.Module):
             
             if self.y_embedding and y is not None:
                 with torch.no_grad():
+                    if y.shape[1] == 1:
+                        W_y = self.W1_y
+                    elif y.shape[1] == 2:
+                        W_y = self.W2_y
+                    elif y.shape[1] == 3:
+                        W_y = self.W3_y
+                    
                     y_emb = y.flatten(start_dim=1) #@ self.W_y
-                    y_emb = torch.einsum('BD,dD->Bd', y_emb, self.W_y) # [B, d]
+                    y_emb = torch.einsum('BD,dD->Bd', y_emb, W_y) # [B, d]
                     y_emb = self.act(y_emb)
                     
                 y_emb = self.mlp_y(y_emb)
@@ -550,7 +577,7 @@ class RAMv2(Reconstructor, Denoiser):
         else:
             x0 = x0_prox
             # noise_cond.shape = [B, z_embedding_dim]
-            noise_cond = self.noise_embedding(torch.stack((sigma, gain), dim=1))
+            noise_cond = self.noise_embedding(torch.stack((torch.log(sigma), torch.log(gain)), dim=1))
 
         if input_cond is not None and self.cond_in_channels > 0:
             x0 = torch.cat((x0, input_cond), dim=1)

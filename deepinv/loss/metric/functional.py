@@ -22,7 +22,8 @@ def cal_psnr(
     """
     with torch.no_grad():
         pixel_range = max_pixel - min_pixel
-        pixel_range[pixel_range == 0] = 1.0  # avoid division by zero
+        if isinstance(max_pixel, torch.Tensor) or isinstance(min_pixel, torch.Tensor):
+            pixel_range[pixel_range == 0] = 1.0  # avoid division by zero
         psnr = -10.0 * torch.log10(cal_mse(a, b) / pixel_range ** 2 + 1e-8)
     return psnr
 
