@@ -1082,6 +1082,12 @@ class MeasCondBlock(nn.Module):
             relu_in=False,
             skip_in=True,
         )
+        for name, module in self.encoding_conv.named_modules():
+            if isinstance(module, nn.Conv2d):
+                # module.weight.data.zero_()
+                module.weight.data.mul_(1e-2)
+                if module.bias is not None:
+                    module.bias.data.zero_()
 
     def forward(self, x, y, physics, img_channels=None, scale=1):
         physics.set_scale(scale)
