@@ -13,9 +13,9 @@ from deepinv.models.utils import LayerNorm_AF2d
 import timm
 import math
 
-def modulate(x, scale=None, shift=None, gate=None):
+def modulate(x, scale=None, shift=None, gate=None, legacy=False):
     if scale is not None:
-        x = x * scale
+        x = x * (1 + scale) if not legacy else x * scale
     if shift is not None:
         x = x + shift
     if gate is not None:
@@ -1366,8 +1366,8 @@ class ResBlock(nn.Module):
                         ),
                     )             
 
-                    self.cs_embedding[-1].weight.data.mul_(1e-2)
-                    self.cs_embedding[-1].bias.data.mul_(1e-2)
+                    self.cs_embedding[-1].weight.data.mul_(1e-3)
+                    self.cs_embedding[-1].bias.data.mul_(1e-3)
 
                     # for logging purposes
                     self.cs_embedding.use_scale_shift_gate_norm = use_scale_shift_gate_norm
