@@ -336,6 +336,7 @@ class ImageFolder(ImageDataset):
         loader: Callable[[str | Path], Tensor] = None,
         estimate_params: Callable[[Tensor, Tensor], dict] | None = None,
         transform: Callable | tuple[Callable, Callable] | None = None,
+        dataset_rate: float = 1.0,
     ):
         super().__init__()
         self.root = Path(root)
@@ -375,10 +376,11 @@ class ImageFolder(ImageDataset):
         self.loader = (
             loader if loader is not None else lambda fn: Image.open(fn).convert("RGB")
         )
+        self.dataset_rate = dataset_rate
 
     def __len__(self):
-        return len(self.x_paths) if self.x_paths is not None else len(self.y_paths)
-
+        size =  len(self.x_paths) if self.x_paths is not None else len(self.y_paths)
+        return int(size * self.dataset_rate)
     def __getitem__(self, idx):
         if self.x_paths is None:
             x = torch.nan
