@@ -3,10 +3,74 @@ import numpy as np
 import math
 from math import ceil, floor, pi
 from deepinv.physics.generator import PhysicsGenerator
+from deepinv.physics.generator.base import _validate_max_sample
 from deepinv.physics.functional import histogramdd, conv2d
 from deepinv.physics.functional.blur import gaussian_blur_nd
 from deepinv.physics.functional.interp import ThinPlateSpline
 
+def random_uniform(
+    *size: tuple[int, ...],
+    low: float = 0.0,
+    high: float = 1.0,
+    generator: torch.Generator = None,
+    device: torch.device = None,
+    dtype: torch.dtype = None,
+    **kwargs,
+) -> torch.Tensor:
+    r"""
+    Returns a tensor filled with random numbers from a uniform distribution on the interval :math:`[low, high)`.
+
+    The method has the same signature as :func:`torch.rand` with additional arguments `low` and `high` to specify the range of the uniform distribution. The output is computed as:
+
+    .. math:: \text{output} = \text{torch.rand}(*size, generator=generator, device=device, dtype=dtype, **kwargs) \times (high - low) + low
+
+    :param tuple[int, ...] size: the shape of the output tensor.
+    :param float low: the lower bound of the uniform distribution. Default is 0.0.
+    :param float high: the upper bound of the uniform distribution. Default is 1.0.
+    :param torch.Generator generator: an optional random number generator for sampling. Default is None, meaning that the default generator will be used.
+    :param torch.device device: the desired device of the returned tensor. Default is None, meaning that the returned tensor will be allocated on the same device as the default generator.
+    :param torch.dtype dtype: the desired data type of the returned tensor. Default is None, meaning that the returned tensor will have the same data type as the default generator.
+    :param dict kwargs: additional keyword arguments to be passed to :func:`torch.rand`.
+    :return: a tensor of shape `size` filled with random numbers from the specified uniform distribution, allocated on the specified device and with the specified data type.
+    """
+
+    if high < low:
+        raise ValueError(
+            "The upper bound 'high' must be greater than or equal to the lower bound 'low'."
+        )
+
+    return (
+        torch.rand(*size, generator=generator, device=device, dtype=dtype, **kwargs)
+        * (high - low)
+        + low
+    )
+
+def _as_sequence(val):
+    r"""
+    Ensure value is a sequence. If the input is a single int or float, it is converted to a tuple of length 1.
+    """
+    if isinstance(val, (int, float)):
+        return (val,)
+    if isinstance(val, (tuple, list)):
+        return tuple(val)
+    raise TypeError(f"Expected int/float or sequence for parameter, got {type(val)}.")
+
+
+def _check_pairwise_leq(mins, maxs, name_mins: str, name_maxs: str):
+    r"""
+    Check that each component of `mins` is less than or equal to the corresponding component of `maxs`.
+    Raises a ValueError with a descriptive message if any component violates the constraint.
+    """
+    if len(mins) != len(maxs):
+        raise ValueError(
+            f"{name_mins} and {name_maxs} must have the same length. Got {len(mins)} and {len(maxs)}."
+        )
+
+    for m, M in zip(mins, maxs, strict=True):
+        if m > M:
+            raise ValueError(
+                f"Each component of {name_mins} should be less than or equal to the corresponding component of {name_maxs}. Got {name_mins} = {mins} and {name_maxs} = {maxs}."
+            )
 
 class PSFGenerator(PhysicsGenerator):
     r"""
@@ -32,7 +96,44 @@ class PSFGenerator(PhysicsGenerator):
         self.psf_size = psf_size
         self.num_channels = num_channels
 
+
 class GaussianBlurGenerator(PSFGenerator):
+    r"""
+    Random Gaussian blur generator. Generates 1D, 2D, or 3D Gaussian kernels with random standard deviations and rotation angles.
+
+    :param tuple[int, ...] psf_size: the shape of the generated point spread function (PSF). The dimension (1D, 2D, or 3D) of the kernel is determined by the length of the ``psf_size`` tuple.
+    :param float | tuple[float, ...] sigma_min: the minimum standard deviation(s) for the Gaussian kernel. If a single value is provided, it is applied to all dimensions. If a tuple is provided, it should have the same length as the number of dimensions and specify the minimum sigma for each dimension.
+    :param float | tuple[float, ...] sigma_max: the maximum standard deviation(s) for the Gaussian kernel. Follows the same format as ``sigma_min``.
+    :param bool isotropic: If True, the generated Gaussian kernels will be isotropic (same sigma for all dimensions). If False, the kernels can be anisotropic (different sigma for each dimension). Defaults to True.
+    :param float | tuple[float, ...] angle_min: the minimum rotation angle(s) for the Gaussian kernel in degrees. For 2D kernels, this is a single angle of rotation in the plane. For 3D kernels, this can be a tuple of three angles (alpha, beta, gamma) representing minimum rotation values around the x, y, and z axes respectively. In 3D, if a single angle is provided, it is used as minimum value for all axes.
+    :param float | tuple[float, ...] angle_max: the maximum rotation angle(s) for the Gaussian kernel in degrees. Follows the same format as ``angle_min``.
+    :param int num_channels: number of images channels. Defaults to 1.
+    :param int max_sample: if given, the generator can only ever produce this many *unique* kernels. A fixed pool of ``max_sample`` random parameter sets is drawn once at construction time, and every call to :meth:`step` samples (with replacement) from this pool. Sampling infinitely many kernels therefore yields at most ``max_sample`` distinct ones. If ``None`` (default), a fresh random kernel is drawn on every call, i.e. unbounded unique samples.
+    :param torch.Generator rng: PyTorch random number generator for reproducibility. If ``None``, a torch.Generator will be created on the specified device.
+    :param str device: the device to create the tensors on. Defaults to "cpu".
+    :param type dtype: the data type of the generated tensors. Defaults to torch.float32.
+
+    |sep|
+
+    :Examples:
+
+    >>> import deepinv as dinv
+    >>> rng = torch.Generator(device="cpu").manual_seed(0)
+    >>> generator = dinv.physics.generator.GaussianBlurGenerator((7, 7), device="cpu", rng=rng, isotropic=False)
+    >>> params = generator.step(batch_size=4)  # dict_keys(['filter'])
+    >>> dinv.utils.plot(params['filter'])  # doctest: +SKIP
+
+    .. plot::
+
+        import torch
+        import deepinv as dinv
+        rng = torch.Generator(device="cpu").manual_seed(0)
+        generator = dinv.physics.generator.GaussianBlurGenerator((7, 7), device="cpu", rng=rng, isotropic=False)
+        params = generator.step(batch_size=4)
+        dinv.utils.plot(params['filter'])
+
+    """
+
     def __init__(
         self,
         psf_size: tuple[int, ...],
@@ -45,93 +146,27 @@ class GaussianBlurGenerator(PSFGenerator):
         rng: torch.Generator = None,
         device: str = "cpu",
         dtype: type = torch.float32,
+        max_sample: int = None,
     ):
-        r"""
-        Random Gaussian blur generator. Generates 1D, 2D, or 3D Gaussian kernels with random standard deviations and rotation angles.
-
-        :param tuple[int, ...] psf_size: the shape of the generated point spread function (PSF).
-        :param float | tuple[float, ...] sigma_min: the minimum standard deviation(s) for the Gaussian kernel. If a single value is provided, it is applied to all dimensions. If a tuple is provided, it should have the same length as the number of dimensions and specify the minimum sigma for each dimension.
-        :param float | tuple[float, ...] sigma_max: the maximum standard deviation(s) for the Gaussian kernel. Follows the same format as ``sigma_min``.
-        :param bool isotropic: If True, the generated Gaussian kernels will be isotropic (same sigma for all dimensions). If False, the kernels can be anisotropic (different sigma for each dimension). Defaults to True.
-        :param float | tuple[float, ...] angle_min: the minimum rotation angle(s) for the Gaussian kernel in degrees. For 2D kernels, this is a single angle of rotation in the plane. For 3D kernels, this can be a tuple of three angles (alpha, beta, gamma) representing minimum rotation values around the x, y, and z axes respectively. In 3D, if a single angle is provided, it is used as minimum value for all axes.
-        :param float | tuple[float, ...] angle_max: the maximum rotation angle(s) for the Gaussian kernel in degrees. Follows the same format as ``angle_min``.
-        :param int num_channels: number of images channels. Defaults to 1.
-        :param torch.Generator rng: PyTorch random number generator for reproducibility. If ``None``, a torch.Generator will be created on the specified device.
-        :param str device: the device to create the tensors on. Defaults to "cpu".
-        :param type dtype: the data type of the generated tensors. Defaults to torch.float32.
-        """
 
         dim = len(psf_size)
         if dim not in {1, 2, 3}:
             raise ValueError("Only 1D, 2D, and 3D kernels are supported.")
 
-        if isinstance(sigma_min, (int, float)):
-            sigma_min = (sigma_min,)
-        if isinstance(sigma_max, (int, float)):
-            sigma_max = (sigma_max,)
+        _validate_max_sample(max_sample)
 
-        if len(sigma_min) == 1 and len(sigma_max) == 1:
-            sigma_min = sigma_min * dim
-            sigma_max = sigma_max * dim
-
-        else:
-            if dim == 1:
-                raise ValueError(
-                    f"For 1D kernels, sigma_min and sigma_max should be single values. Got sigma_min = {sigma_min} and sigma_max = {sigma_max}."
-                )
-
-            if len(sigma_min) != len(sigma_max):
-                raise ValueError(
-                    f"sigma_min and sigma_max should have the same length. Got {len(sigma_min)} and {len(sigma_max)}."
-                )
-
-            if len(sigma_min) != dim or len(sigma_max) != dim:
-                raise ValueError(
-                    f"Length of sigma_min and sigma_max should be either 1 or {dim}."
-                )
-
-        for smin, smax in zip(sigma_min, sigma_max, strict=True):
-            if smin > smax:
-                raise ValueError(
-                    f"Each component of sigma_min should be less than or equal to the corresponding component of sigma_max. Got sigma_min = {sigma_min} and sigma_max = {sigma_max}."
-                )
-
-        if dim == 2:
-            if isinstance(angle_min, (tuple, list)):
-                if len(angle_min) != 1:
-                    raise ValueError(
-                        f"For 2D kernels, angle_min should be a single value or a tuple/list of length 1. Got angle_min = {angle_min}."
-                    )
-                angle_min = angle_min[0]
-
-            if isinstance(angle_max, (tuple, list)):
-                if len(angle_max) != 1:
-                    raise ValueError(
-                        f"For 2D kernels, angle_max should be a single value or a tuple/list of length 1. Got angle_max = {angle_max}."
-                    )
-                angle_max = angle_max[0]
-
-            if angle_min > angle_max:
-                raise ValueError(
-                    f"angle_min should be less than or equal to angle_max. Got angle_min = {angle_min} and angle_max = {angle_max}."
-                )
-
-        elif dim == 3:
-            if isinstance(angle_min, (int, float)):
-                angle_min = (angle_min,) * 3
-            if isinstance(angle_max, (int, float)):
-                angle_max = (angle_max,) * 3
-
-            if len(angle_min) != 3 or len(angle_max) != 3:
-                raise ValueError(
-                    f"For 3D kernels, angle_min and angle_max should have three values corresponding to rotations around x, y, and z axes. Got angle_min = {angle_min} and angle_max = {angle_max}."
-                )
-
-            for amin, amax in zip(angle_min, angle_max, strict=True):
-                if amin > amax:
-                    raise ValueError(
-                        f"Each component of angle_min should be less than or equal to the corresponding component of angle_max. Got angle_min = {angle_min} and angle_max = {angle_max}."
-                    )
+        sigma_min, sigma_max = self._resolve_sequences_dimensionality(
+            sigma_min, sigma_max, dim, name_min="sigma_min", name_max="sigma_max"
+        )
+        angle_min, angle_max = self._resolve_sequences_dimensionality(
+            angle_min,
+            angle_max,
+            dim=(
+                3 if dim == 3 else 1
+            ),  # For 2D, the angle is a single value of rotation in the plane, for 3D it can be a tuple of 3 values
+            name_min="angle_min",
+            name_max="angle_max",
+        )
 
         kwargs = {
             "dim": dim,
@@ -145,6 +180,92 @@ class GaussianBlurGenerator(PSFGenerator):
         }
         super().__init__(device=device, dtype=dtype, rng=rng, **kwargs)
 
+        # Build the fixed pool of unique parameter sets (drawn once, here).
+        # `step` will index into these instead of resampling, capping the number
+        # of distinct kernels at `max_sample`.
+        self.max_sample = max_sample
+        if max_sample is not None:
+            max_sample_generator = torch.Generator(device=device).manual_seed(0)
+
+            self._sigma_pool = self._generate_parameters(
+                max_sample, self.sigma_min, self.sigma_max, isotropic=self.isotropic, generator=max_sample_generator
+            )
+            self._angle_pool = self._generate_parameters(
+                max_sample, self.angle_min, self.angle_max, isotropic=False, generator=max_sample_generator
+            )
+
+    @staticmethod
+    def _resolve_sequences_dimensionality(
+        min_vals: tuple[float, ...],
+        max_vals: tuple[float, ...],
+        dim: int,
+        name_min: str = None,
+        name_max: str = None,
+    ):
+
+        min_vals = _as_sequence(min_vals)
+        max_vals = _as_sequence(max_vals)
+
+        if len(min_vals) == 1:
+            min_vals = min_vals * dim
+        if len(max_vals) == 1:
+            max_vals = max_vals * dim
+
+        if len(min_vals) != dim or len(max_vals) != dim:
+            raise ValueError(
+                f"Length of {name_min} and {name_max} should be either 1 or {dim}. Got len({name_min})={len(min_vals)} and len({name_max})={len(max_vals)}."
+            )
+
+        _check_pairwise_leq(min_vals, max_vals, name_min, name_max)
+
+        return min_vals, max_vals
+
+    def _generate_parameters(
+        self, batch_size: int, min_vals, max_vals, isotropic: bool = False, generator: torch.Generator = None
+    ):
+
+        if isotropic:
+            params = torch.stack(
+                [
+                    random_uniform(
+                        batch_size,
+                        low=min_vals[0],
+                        high=max_vals[0],
+                        generator=self.rng if generator is None else generator,
+                        **self.factory_kwargs,
+                    )
+                ]
+                * len(min_vals),
+                dim=-1,
+            )
+        else:
+            params = torch.stack(
+                [
+                    random_uniform(
+                        batch_size,
+                        low=min_val,
+                        high=max_val,
+                        generator=self.rng if generator is None else generator,
+                        **self.factory_kwargs,
+                    )
+                    for min_val, max_val in zip(min_vals, max_vals, strict=True)
+                ],
+                dim=-1,
+            )  # Shape: (batch_size, dim)
+
+        return params
+
+    def _sample_from_pool(self, batch_size: int):
+        r"""Draw ``batch_size`` indices (with replacement) into the fixed pool
+        and return the corresponding ``(sigma, angle)`` parameter sets."""
+        idx = torch.randint(
+            self.max_sample,
+            (batch_size,),
+            generator=self.rng,
+            device=self._sigma_pool.device,
+        )
+        return self._sigma_pool[idx], self._angle_pool[idx]
+
     def step(
         self,
         batch_size: int = 1,
@@ -156,62 +277,31 @@ class GaussianBlurGenerator(PSFGenerator):
         self.rng_manual_seed(seed)
         dim = len(self.psf_size)
 
-        if sigma is None:
-            if self.isotropic:
-                sigma = torch.stack(
-                    [
-                        torch.rand(
-                            batch_size, generator=self.rng, **self.factory_kwargs
-                        )
-                        * (self.sigma_max[0] - self.sigma_min[0])
-                        + self.sigma_min[0]
-                    ]
-                    * dim,
-                    dim=-1,
-                )  # Shape: (batch_size, dim)
-
-            else:
-                # Sample sigmas for each dimension and each kernel in the batch
-                sigma = torch.stack(
-                    [
-                        torch.rand(
-                            batch_size, generator=self.rng, **self.factory_kwargs
-                        )
-                        * (smax - smin)
-                        + smin
-                        for smin, smax in zip(
-                            self.sigma_min, self.sigma_max, strict=True
-                        )
-                    ],
-                    dim=-1,
-                )  # Shape: (batch_size, dim)
-
-        if angle is None and dim > 1:
-            if dim == 2:
-                angle = (
-                    torch.rand(batch_size, generator=self.rng, **self.factory_kwargs)
-                    * (self.angle_max - self.angle_min)
-                    + self.angle_min
-                )  # Shape: (batch_size,)
-            elif dim == 3:
-                angle = torch.stack(
-                    [
-                        torch.rand(
-                            batch_size, generator=self.rng, **self.factory_kwargs
-                        )
-                        * (amax - amin)
-                        + amin
-                        for amin, amax in zip(
-                            self.angle_min, self.angle_max, strict=True
-                        )
-                    ],
-                    dim=-1,
-                )  # Shape: (batch_size, 3)
+        if self.max_sample is not None and (sigma is None or angle is None):
+            # Sample from the fixed pool instead of drawing fresh parameters,
+            # capping the number of unique kernels at `max_sample`. Explicitly
+            # passed `sigma`/`angle` still override the pool.
+            pool_sigma, pool_angle = self._sample_from_pool(batch_size)
+            sigma = pool_sigma if sigma is None else sigma
+            angle = pool_angle if angle is None else angle
+        else:
+            sigma = (
+                self._generate_parameters(
+                    batch_size, self.sigma_min, self.sigma_max, isotropic=self.isotropic
+                )
+                if sigma is None
+                else sigma
+            )
+            angle = (
+                self._generate_parameters(
+                    batch_size, self.angle_min, self.angle_max, isotropic=False
+                )
+                if angle is None
+                else angle
+            )
 
         # filter.shape = (batch_size, 1, *psf_size)
-        filters = gaussian_blur_nd(
-            self.psf_size, sigma, angle, batch_size=batch_size, device=self.device
-        )
+        filters = gaussian_blur_nd(self.psf_size, sigma, angle, **self.factory_kwargs)
         return {"filter": filters.expand(-1, self.num_channels, *(-1,) * dim)}
 
 
@@ -239,6 +329,7 @@ class MotionBlurGenerator(PSFGenerator):
     :param float l: the length scale of the trajectory, defaults to 0.3
     :param float sigma: the standard deviation of the Gaussian Process, defaults to 0.25
     :param int n_steps: the number of points in the trajectory, defaults to 1000
+    :param int max_sample: if given, the generator can only ever produce this many *unique* kernels. A fixed pool of ``max_sample`` random trajectories is drawn once at construction time, and every call to :meth:`step` samples (with replacement) from this pool. Sampling infinitely many kernels therefore yields at most ``max_sample`` distinct ones. If ``None`` (default), a fresh random trajectory is drawn on every call, i.e. unbounded unique samples.
 
     |sep|
 
@@ -261,6 +352,7 @@ class MotionBlurGenerator(PSFGenerator):
         l: float = 0.3,
         sigma: float = 0.25,
         n_steps: int = 1000,
+        max_sample: int = None,
     ) -> None:
         kwargs = {"l": l, "sigma": sigma, "n_steps": n_steps}
         if isinstance(psf_size, int):
@@ -270,6 +362,9 @@ class MotionBlurGenerator(PSFGenerator):
             raise ValueError(
                 "psf_size must 2D. Add channels via num_channels parameter"
             )
+
+        _validate_max_sample(max_sample)
+
         super().__init__(
             psf_size=psf_size,
             num_channels=num_channels,
@@ -278,6 +373,19 @@ class MotionBlurGenerator(PSFGenerator):
             rng=rng,
             **kwargs,
         )
+
+        # Build the fixed pool of unique trajectories (drawn once, here).
+        # `step` will index into these instead of resampling, capping the number
+        # of distinct kernels at `max_sample`.
+        self.max_sample = max_sample
+        if max_sample is not None:
+            max_sample_generator = torch.Generator(device=device).manual_seed(0)
+            self._vec_x_pool = torch.randn(
+                max_sample, self.n_steps, generator=max_sample_generator, **self.factory_kwargs
+            )
+            self._vec_y_pool = torch.randn(
+                max_sample, self.n_steps, generator=max_sample_generator, **self.factory_kwargs
+            )
 
     def matern_kernel(self, diff, sigma: float = None, l: float = None):
         r"""
@@ -294,18 +402,26 @@ class MotionBlurGenerator(PSFGenerator):
         fraction = 5**0.5 * diff.abs() / l
         return sigma**2 * (1 + fraction + fraction**2 / 3) * torch.exp(-fraction)
 
-    def f_matern(self, batch_size: int = 1, sigma: float = None, l: float = None):
+    def f_matern(
+        self,
+        batch_size: int = 1,
+        sigma: float = None,
+        l: float = None,
+        vec: torch.Tensor = None,
+    ):
         r"""
         Generates the trajectory.
 
         :param int batch_size: batch_size.
         :param float sigma: the standard deviation of the Gaussian Process.
         :param float l: the length scale of the trajectory.
+        :param torch.Tensor vec: the white noise driving the trajectory, of shape `(batch_size, n_steps)`. If ``None``, freshly sampled standard normal noise is used.
         :return: the trajectory of shape `(batch_size, n_steps)`
         """
-        vec = torch.randn(
-            batch_size, self.n_steps, generator=self.rng, **self.factory_kwargs
-        )
+        if vec is None:
+            vec = torch.randn(
+                batch_size, self.n_steps, generator=self.rng, **self.factory_kwargs
+            )
         time = torch.linspace(-torch.pi, torch.pi, self.n_steps, **self.factory_kwargs)[
             None
         ]
@@ -319,6 +435,17 @@ class MotionBlurGenerator(PSFGenerator):
                 torch.int
             ),
         ]
+
+    def _sample_from_pool(self, batch_size: int):
+        r"""Draw ``batch_size`` indices (with replacement) into the fixed pool
+        and return the corresponding ``(vec_x, vec_y)`` trajectory noise."""
+        idx = torch.randint(
+            self.max_sample,
+            (batch_size,),
+            generator=self.rng,
+            device=self._vec_x_pool.device,
+        )
+        return self._vec_x_pool[idx], self._vec_y_pool[idx]
 
     def step(
         self,
@@ -336,11 +463,21 @@ class MotionBlurGenerator(PSFGenerator):
         :param float l: the length scale of the trajectory
         :param int seed: the seed for the random number generator.
 
-        :return: dictionary with key **'filter'**: the generated PSF of shape `(batch_size, 1, psf_size[0], psf_size[1])`
+        :return: dictionary with keys
+
+            - `filter`: the generated PSF of shape `(batch_size, 1, psf_size[0], psf_size[1])`
         """
         self.rng_manual_seed(seed)
-        f_x = self.f_matern(batch_size, sigma, l)[..., None]
-        f_y = self.f_matern(batch_size, sigma, l)[..., None]
+
+        if self.max_sample is not None:
+            # Sample from the fixed pool instead of drawing fresh trajectory
+            # noise, capping the number of unique kernels at `max_sample`.
+            vec_x, vec_y = self._sample_from_pool(batch_size)
+        else:
+            vec_x, vec_y = None, None
+
+        f_x = self.f_matern(batch_size, sigma, l, vec=vec_x)[..., None]
+        f_y = self.f_matern(batch_size, sigma, l, vec=vec_y)[..., None]
 
         trajectories = torch.cat(
             (
@@ -386,6 +523,7 @@ class DiffractionBlurGenerator(PSFGenerator):
     :param tuple[int] pupil_size: this is used to synthesize the super-resolved pupil.
         The higher the more precise, defaults to ``(256, 256)``.
         If a single ``int`` is given, a square pupil is considered.
+    :param int max_sample: if given, the generator can only ever produce this many *unique* kernels. A fixed pool of ``max_sample`` random Zernike coefficient vectors is drawn once at construction time, and every call to :meth:`step` samples (with replacement) from this pool. Sampling infinitely many kernels therefore yields at most ``max_sample`` distinct ones. If ``None`` (default), a fresh random kernel is drawn on every call, i.e. unbounded unique samples.
 
     |sep|
 
@@ -420,7 +558,10 @@ class DiffractionBlurGenerator(PSFGenerator):
         fc: float = 0.2,
         max_zernike_amplitude: float = 0.15,
         pupil_size: tuple[int] = (256, 256),
+        max_sample: int = None,
     ):
+        _validate_max_sample(max_sample)
+
         kwargs = {
             "list_param": list_param,
             "fc": fc,
@@ -486,6 +627,16 @@ class DiffractionBlurGenerator(PSFGenerator):
                 XX, YY
             )  # defining the k-th Zernike polynomial
 
+        # Build the fixed pool of unique Zernike coefficient sets (drawn once, here).
+        # `step` will index into these instead of resampling, capping the number
+        # of distinct kernels at `max_sample`.
+        self.max_sample = max_sample
+        if max_sample is not None:
+            max_sample_generator = torch.Generator(device=device).manual_seed(0)
+            self._coeff_pool = self.generate_coeff(
+                max_sample, generator=max_sample_generator
+            )
+
     def __update__(self):
         r"""
         Update the device and dtype of Zernike polynomials and the coordinates
@@ -514,7 +665,11 @@ class DiffractionBlurGenerator(PSFGenerator):
         self.__update__()
         self.rng_manual_seed(seed)
         if coeff is None:
-            coeff = self.generate_coeff(batch_size)
+            coeff = (
+                self._sample_from_pool(batch_size)
+                if self.max_sample is not None
+                else self.generate_coeff(batch_size)
+            )
 
         pupil1 = (self.Z @ coeff[:, : self.n_zernike].T).transpose(2, 0)
         pupil2 = torch.exp(-2.0j * torch.pi * pupil1)
@@ -538,21 +693,33 @@ class DiffractionBlurGenerator(PSFGenerator):
             "pupil": pupil3,
         }
 
-    def generate_coeff(self, batch_size):
+    def generate_coeff(self, batch_size, generator: torch.Generator = None):
         r"""Generates random coefficients of the decomposition in the Zernike polynomials.
 
         :param int batch_size: batch_size.
+        :param torch.Generator generator: optional random number generator to use instead of ``self.rng``.
 
         :return: a tensor of shape `(batch_size, len(list_param))` coefficients in the Zernike decomposition.
 
         """
         coeff = torch.rand(
             (batch_size, len(self.list_param)),
-            generator=self.rng,
+            generator=self.rng if generator is None else generator,
             **self.factory_kwargs,
         )
         coeff = (coeff - 0.5) * self.max_zernike_amplitude
         return coeff
+
+    def _sample_from_pool(self, batch_size: int):
+        r"""Draw ``batch_size`` indices (with replacement) into the fixed pool
+        and return the corresponding Zernike coefficient sets."""
+        idx = torch.randint(
+            self.max_sample,
+            (batch_size,),
+            generator=self.rng,
+            device=self._coeff_pool.device,
+        )
+        return self._coeff_pool[idx]
 
 
 def define_zernike():

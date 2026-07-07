@@ -214,6 +214,64 @@ def test_average(name, device, dtype):
         assert set(params.keys()) == keys
 
 
+@pytest.mark.parametrize("max_sample", [0, -1, 1.5])
+def test_max_sample_validation(max_sample):
+    r"""
+    Tests that all generators supporting `max_sample` reject invalid values.
+    """
+    with pytest.raises(ValueError):
+        dinv.physics.generator.GaussianBlurGenerator((5, 5), max_sample=max_sample)
+    with pytest.raises(ValueError):
+        dinv.physics.generator.MotionBlurGenerator((5, 5), max_sample=max_sample)
+    with pytest.raises(ValueError):
+        dinv.physics.generator.DiffractionBlurGenerator((5, 5), max_sample=max_sample)
+    with pytest.raises(ValueError):
+        dinv.physics.generator.GaussianMaskGenerator((64, 64), max_sample=max_sample)
+    with pytest.raises(ValueError):
+        dinv.physics.generator.BernoulliSplittingMaskGenerator(
+            (1, 8, 8), split_ratio=0.5, max_sample=max_sample
+        )
+
+
+@pytest.mark.parametrize(
+    "name", ["GaussianBlurGenerator", "MotionBlurGenerator", "DiffractionBlurGenerator"]
+)
+def test_max_sample_psf_generators(name):
+    r"""
+    Tests that `max_sample` caps the number of unique kernels a PSF generator
+    can produce.
+    """
+    size = (7, 7)
+    max_sample = 3
+
+    def build(max_sample):
+        if name == "GaussianBlurGenerator":
+            return dinv.physics.generator.GaussianBlurGenerator(
+                size, max_sample=max_sample
+            )
+        elif name == "MotionBlurGenerator":
+            return dinv.physics.generator.MotionBlurGenerator(
+                size, max_sample=max_sample
+            )
+        else:
+            return dinv.physics.generator.DiffractionBlurGenerator(
+                size, max_sample=max_sample
+            )
+
+    generator = build(max_sample)
+    filters = torch.cat(
+        [generator.step(batch_size=10, seed=s)["filter"] for s in range(5)], dim=0
+    )
+    n_unique = torch.unique(filters.flatten(1), dim=0).shape[0]
+    assert n_unique <= max_sample
+
+    # max_sample=1 forces every draw to be bit-identical
+    generator = build(1)
+    f0 = generator.step(batch_size=1, seed=0)["filter"]
+    f1 = generator.step(batch_size=1, seed=1)["filter"]
+    assert torch.allclose(f0, f1)
+
+
 #################################
 ### DOWNSAMPLING GENERATORS #####
 #################################
@@ -280,22 +338,35 @@ def batch_size():
     return 2
 
 
-def choose_mri_generator(generator_name, img_size, acc, center_fraction):
+def choose_mri_generator(generator_name, img_size, acc, center_fraction, max_sample=None):
     if generator_name == "gaussian":
         g = GaussianMaskGenerator(
-            img_size, acceleration=acc, center_fraction=center_fraction
+            img_size,
+            acceleration=acc,
+            center_fraction=center_fraction,
+            max_sample=max_sample,
         )
     elif generator_name == "random":
         g = RandomMaskGenerator(
-            img_size, acceleration=acc, center_fraction=center_fraction
+            img_size,
+            acceleration=acc,
+            center_fraction=center_fraction,
+            max_sample=max_sample,
         )
     elif generator_name == "uniform":
         g = EquispacedMaskGenerator(
-            img_size, acceleration=acc, center_fraction=center_fraction
+            img_size,
+            acceleration=acc,
+            center_fraction=center_fraction,
+            max_sample=max_sample,
         )
     elif generator_name == "poly":
         g = PolyOrderMaskGenerator(
-            img_size, acceleration=acc, center_fraction=center_fraction, poly_order=2
+            img_size,
+            acceleration=acc,
+            center_fraction=center_fraction,
+            poly_order=2,
+            max_sample=max_sample,
         )
     return g
 
@@ -339,6 +410,34 @@ def test_mri_generator(generator_name, img_size, batch_size, acc, center_fractio
 
     if generator.n_lines != 0 and generator_name != "uniform":
         assert not torch.allclose(mask, mask2)
+
+
+@pytest.mark.parametrize("generator_name", MRI_GENERATORS)
+def test_max_sample_mri_generator(generator_name):
+    r"""
+    Tests that `max_sample` caps the number of unique masks a MRI mask
+    generator can produce. Also regression-checks the lazy pool construction
+    against `PolyOrderMaskGenerator`'s deferred `self.pdf` setup.
+    """
+    img_size = (2, 64, 64)
+    max_sample = 3
+    generator = choose_mri_generator(
+        generator_name, img_size, acc=4, center_fraction=0.04, max_sample=max_sample
+    )
+
+    masks = torch.cat(
+        [generator.step(batch_size=10, seed=s)["mask"] for s in range(5)], dim=0
+    )
+    n_unique = torch.unique(masks.flatten(1), dim=0).shape[0]
+    assert n_unique <= max_sample
+
+    # Explicit img_size override bypasses the pool but still works.
+    # NOTE: PolyOrderMaskGenerator.sample_mask has a pre-existing bug unrelated
+    # to max_sample where it doesn't support an img_size override at all
+    # (it hardcodes self.H/self.W), so this check is skipped for "poly".
+    if generator_name != "poly":
+        out = generator.step(batch_size=2, img_size=(32, 32))["mask"]
+        assert out.shape[-2:] == (32, 32)
 
 
 #############################
@@ -532,6 +631,47 @@ def test_inpainting_generator_random_ratio(num_channels, device, dtype, rng):
 
     # check that split ratios are different between batches
     assert abs(list_exp_split_ratio[0] - list_exp_split_ratio[1]) > 1e-2
+
+
+def test_max_sample_bernoulli_splitting():
+    r"""
+    Tests that `max_sample` caps the number of unique masks produced by
+    BernoulliSplittingMaskGenerator, including when combined with
+    random_split_ratio (paired split_ratio pool keeps the cap strict).
+    """
+    img_size = (2, 16, 16)
+    max_sample = 3
+
+    generator = dinv.physics.generator.BernoulliSplittingMaskGenerator(
+        img_size, split_ratio=0.5, max_sample=max_sample
+    )
+    masks = torch.cat(
+        [generator.step(batch_size=10, seed=s)["mask"] for s in range(5)], dim=0
+    )
+    n_unique = torch.unique(masks.flatten(1), dim=0).shape[0]
+    assert n_unique <= max_sample
+
+    # random_split_ratio: paired split_ratio pool should keep the cap strict
+    generator = dinv.physics.generator.BernoulliSplittingMaskGenerator(
+        img_size,
+        split_ratio=0.5,
+        random_split_ratio=True,
+        min_split_ratio=0.1,
+        max_split_ratio=0.9,
+        max_sample=max_sample,
+    )
+    masks = torch.cat(
+        [generator.step(batch_size=10, seed=s)["mask"] for s in range(5)], dim=0
+    )
+    n_unique = torch.unique(masks.flatten(1), dim=0).shape[0]
+    assert n_unique <= max_sample
+
+    # Subclasses that fully override batch_step() aren't affected: max_sample
+    # is stored but silently ignored; just confirm they still construct/step.
+    gauss_gen = dinv.physics.generator.GaussianSplittingMaskGenerator(
+        img_size, split_ratio=0.5, max_sample=max_sample
+    )
+    gauss_gen.step(batch_size=2)
 
 
 def test_string_seed():

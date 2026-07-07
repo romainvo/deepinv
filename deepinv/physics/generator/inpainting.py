@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from warnings import warn
 import torch
-from deepinv.physics.generator.base import PhysicsGenerator
+from deepinv.physics.generator.base import PhysicsGenerator, _validate_max_sample
 from deepinv.physics.functional import random_choice
 from deepinv.utils.decorators import _deprecated_alias
 
@@ -61,6 +61,7 @@ class BernoulliSplittingMaskGenerator(PhysicsGenerator):
     :param str, torch.device device: device where the tensor is stored (default: 'cpu').
     :param torch.dtype dtype: the data type of the generated parameters
     :param torch.Generator rng: torch random number generator.
+    :param int max_sample: if given, the generator can only ever produce this many *unique* masks, when no meaningful ``input_mask`` is passed and the resolved ``img_size`` matches the generator's default. A fixed pool of ``max_sample`` threshold tensors (and, if ``random_split_ratio`` is True, paired split ratios) is drawn once at construction time, and every call to :meth:`step` samples (with replacement) from this pool. If ``None`` (default), fresh randomness is drawn on every call, i.e. unbounded unique samples.
     """
 
     @_deprecated_alias(tensor_size="img_size")
@@ -75,9 +76,12 @@ class BernoulliSplittingMaskGenerator(PhysicsGenerator):
         device: str | torch.device = torch.device("cpu"),
         dtype: torch.dtype = torch.float32,
         rng: torch.Generator = None,
+        max_sample: int = None,
         *args,
         **kwargs,
     ):
+        _validate_max_sample(max_sample)
+
         super().__init__(*args, device=device, dtype=dtype, rng=rng, **kwargs)
         self.img_size = img_size
         self.split_ratio = split_ratio
@@ -85,6 +89,28 @@ class BernoulliSplittingMaskGenerator(PhysicsGenerator):
         self.random_split_ratio = random_split_ratio
         self.min_split_ratio = min_split_ratio
         self.max_split_ratio = max_split_ratio
+
+        # Build the fixed pool of unique random masks (and, if random_split_ratio,
+        # paired split ratios, so the unique-output cap stays strict) drawn once,
+        # here, from a dedicated generator.
+        self.max_sample = max_sample
+        if max_sample is not None:
+            max_sample_generator = torch.Generator(device=device).manual_seed(0)
+            self._aux_pool = torch.rand(
+                (max_sample, *self.img_size),
+                generator=max_sample_generator,
+                **self.factory_kwargs,
+            )
+            if self.random_split_ratio:
+                self._split_ratio_pool = (
+                    torch.rand(
+                        (max_sample, 1),
+                        generator=max_sample_generator,
+                        **self.factory_kwargs,
+                    )
+                    * (self.max_split_ratio - self.min_split_ratio)
+                    + self.min_split_ratio
+                )
 
     def step(
         self,
@@ -195,14 +221,37 @@ class BernoulliSplittingMaskGenerator(PhysicsGenerator):
             self.img_size if img_size is None else self.img_size[:-2] + img_size[-2:]
         )
 
-        if self.random_split_ratio:
+        has_real_input_mask = (
+            isinstance(input_mask, torch.Tensor) and input_mask.numel() > 1
+        )
+        use_pool = (
+            self.max_sample is not None
+            and not has_real_input_mask
+            and img_size == self.img_size
+        )
+
+        aux = None
+        if use_pool:
+            # Sample from the fixed pool instead of drawing fresh uniform noise,
+            # capping the number of unique masks at `max_sample`. The paired
+            # split_ratio pool keeps the cap strict even under random_split_ratio.
+            pool_idx = torch.randint(
+                self.max_sample,
+                (1,),
+                generator=self.rng,
+                device=self._aux_pool.device,
+            ).item()
+            aux = self._aux_pool[pool_idx]
+            if self.random_split_ratio:
+                self.split_ratio = self._split_ratio_pool[pool_idx]
+        elif self.random_split_ratio:
             self.split_ratio = (
                 torch.rand(1, generator=self.rng, **self.factory_kwargs)
                 * (self.max_split_ratio - self.min_split_ratio)
                 + self.min_split_ratio
             )
 
-        if isinstance(input_mask, torch.Tensor) and input_mask.numel() > 1:
+        if has_real_input_mask:
             input_mask = input_mask.to(self.device)
             # Sample indices from given input mask
             if pixelwise:
@@ -227,7 +276,8 @@ class BernoulliSplittingMaskGenerator(PhysicsGenerator):
         else:
             # Sample pixels from a uniform distribution as input_mask is not given
             mask = torch.ones(img_size, device=self.device)
-            aux = torch.rand(img_size, generator=self.rng, device=self.device)
+            if aux is None:
+                aux = torch.rand(img_size, generator=self.rng, device=self.device)
             if not pixelwise:
                 mask[aux > self.split_ratio] = 0
             else:

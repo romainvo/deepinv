@@ -5,6 +5,7 @@ import warnings
 import torch
 
 from deepinv.physics.generator import PhysicsGenerator
+from deepinv.physics.generator.base import _validate_max_sample
 from deepinv.physics.functional import random_choice
 
 
@@ -23,6 +24,7 @@ class BaseMaskGenerator(PhysicsGenerator, ABC):
     :param int acceleration: acceleration factor, defaults to 4
     :param float center_fraction: fraction of lines to sample in low frequencies (center of k-space). If 0, there is no fixed low-freq sampling. Defaults to None.
     :param torch.Generator rng: torch random generator. Defaults to None.
+    :param int max_sample: if given, the generator can only ever produce this many *unique* masks (for the default configured ``img_size``). A fixed pool of ``max_sample`` masks is drawn once, lazily, on the first call to :meth:`step`, and every subsequent call samples (with replacement) from this pool. Only applies when ``img_size`` is not overridden on a given :meth:`step` call. If ``None`` (default), a fresh random mask is drawn on every call, i.e. unbounded unique samples.
     """
 
     def __init__(
@@ -32,9 +34,12 @@ class BaseMaskGenerator(PhysicsGenerator, ABC):
         center_fraction: float | None = None,
         rng: torch.Generator = None,
         device="cpu",
+        max_sample: int = None,
         *args,
         **kwargs,
     ):
+        _validate_max_sample(max_sample)
+
         super().__init__(*args, **kwargs, rng=rng, device=device)
         self.img_size = img_size
         self.acc = acceleration
@@ -59,6 +64,9 @@ class BaseMaskGenerator(PhysicsGenerator, ABC):
             raise ValueError("img_size must be (H, W) or (C, H, W) or (C, T, H, W)")
 
         self.calculate_lines(self.W)
+
+        self.max_sample = max_sample
+        self._mask_pool = None  # built lazily on first step() call
 
     def calculate_lines(self, W: int):
         """Calculate number of lines and center lines from total width.
@@ -96,6 +104,40 @@ class BaseMaskGenerator(PhysicsGenerator, ABC):
         """
         pass
 
+    def _build_mask_pool(self, _H: int, _W: int):
+        r"""Draw a fixed pool of ``max_sample`` masks once (using a dedicated
+        generator so pool construction doesn't consume `self.rng` state).
+
+        Built lazily on first use (rather than in `__init__`, like the blur
+        generators) since some subclasses (e.g. `PolyOrderMaskGenerator`)
+        finish setting up state needed by `sample_mask` only after `__init__`
+        returns.
+        """
+        _T = self.T if self.T > 0 else 1
+        pool_mask = torch.zeros(
+            (self.max_sample, self.C, _T, _H, _W), **self.factory_kwargs
+        )
+        if self.n_lines + self.n_center >= _W:
+            pool_mask += 1
+        else:
+            saved_rng, self.rng = self.rng, torch.Generator(device=self.device).manual_seed(0)
+            try:
+                pool_mask = self.sample_mask(pool_mask)
+            finally:
+                self.rng = saved_rng
+        self._mask_pool = pool_mask
+
+    def _sample_from_pool(self, batch_size: int):
+        r"""Draw ``batch_size`` indices (with replacement) into the fixed pool
+        and return the corresponding masks."""
+        idx = torch.randint(
+            self.max_sample,
+            (batch_size,),
+            generator=self.rng,
+            device=self._mask_pool.device,
+        )
+        return self._mask_pool[idx]
+
     def step(
         self, batch_size=1, seed: int = None, img_size: tuple | None = None, **kwargs
     ) -> dict:
@@ -117,12 +159,17 @@ class BaseMaskGenerator(PhysicsGenerator, ABC):
 
         self.calculate_lines(_W)
 
-        mask = torch.zeros((_B, self.C, _T, _H, _W), **self.factory_kwargs)
-
-        if self.n_lines + self.n_center >= _W:
-            mask += 1
+        if self.max_sample is not None and img_size is None:
+            if self._mask_pool is None:
+                self._build_mask_pool(_H, _W)
+            mask = self._sample_from_pool(_B)
         else:
-            mask = self.sample_mask(mask)
+            mask = torch.zeros((_B, self.C, _T, _H, _W), **self.factory_kwargs)
+
+            if self.n_lines + self.n_center >= _W:
+                mask += 1
+            else:
+                mask = self.sample_mask(mask)
 
         if self.T == 0:
             mask = mask[:, :, 0, :, :]

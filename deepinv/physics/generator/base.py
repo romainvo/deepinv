@@ -15,6 +15,15 @@ def seed_from_string(seed: str) -> int:
     return int(sha256(seed.encode("utf-8")).hexdigest(), 16) % 0xFFFF_FFFF_FFFF_FFFF
 
 
+def _validate_max_sample(max_sample: int | None) -> None:
+    r"""Validate the optional ``max_sample`` constructor parameter shared by
+    generators that support capping their output to a fixed pool of unique samples."""
+    if max_sample is not None and not (isinstance(max_sample, int) and max_sample > 0):
+        raise ValueError(
+            f"max_sample must be a positive integer or None, got {max_sample!r}."
+        )
+
+
 class PhysicsGenerator(nn.Module):
     r"""
     Base class for parameter generation of physics parameters.
