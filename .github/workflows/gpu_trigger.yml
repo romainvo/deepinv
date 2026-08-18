@@ -80,7 +80,7 @@ jobs:
           reactions: rocket
 
       - name: Trigger GPU Tests from PR branch
-        uses: benc-uk/workflow-dispatch@v1
+        uses: benc-uk/workflow-dispatch@v1.3.2
         with:
           workflow: test_gpu.yml
           ref: "${{ steps.pr.outputs.head_sha }}"
@@ -91,7 +91,7 @@ jobs:
             }
 
       - name: Trigger GPU Docs Check
-        uses: benc-uk/workflow-dispatch@v1
+        uses: benc-uk/workflow-dispatch@v1.3.2
         with:
           workflow: docs_gpu.yml
           ref: "${{ steps.pr.outputs.head_sha }}"
