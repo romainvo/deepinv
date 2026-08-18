@@ -81,30 +81,30 @@ jobs:
           comment-id: ${{ github.event.comment.id }}
           reactions: rocket
 
-      - name: Trigger GPU Tests from PR branch
-        uses: benc-uk/workflow-dispatch@v1.3.2
+      - name: Trigger GPU workflows
+        uses: actions/github-script@v7
+        env:
+          PR_REPO: ${{ steps.pr.outputs.head_repo }}
+          PR_REF: ${{ steps.pr.outputs.head_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_SHA: ${{ steps.pr.outputs.head_sha }}
         with:
-          workflow: test_gpu.yml
-          repo: "${{ steps.pr.outputs.head_repo }}"
-          ref: "${{ steps.pr.outputs.head_ref }}"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          inputs: >-
-            {
-                "pr_number": "${{ steps.pr.outputs.number }}",
-                "pr_sha": "${{ steps.pr.outputs.head_sha }}"
-            }
+          script: |
+            const [owner, repo] = process.env.PR_REPO.split("/");
+            const inputs = {
+              pr_number: process.env.PR_NUMBER,
+              pr_sha: process.env.PR_SHA,
+            };
 
-      - name: Trigger GPU Docs Check
-        uses: benc-uk/workflow-dispatch@v1.3.2
-        with:
-          workflow: docs_gpu.yml
-          repo: "${{ steps.pr.outputs.head_repo }}"
-          ref: "${{ steps.pr.outputs.head_ref }}"
-          token: ${{ secrets.GITHUB_TOKEN }}
-          inputs: >-
-            {
-              "pr_number": "${{ steps.pr.outputs.number }}",
-              "pr_sha": "${{ steps.pr.outputs.head_sha }}"
+            for (const workflow_id of ["test_gpu.yml", "docs_gpu.yml"]) {
+              await github.rest.actions.createWorkflowDispatch({
+                owner,
+                repo,
+                workflow_id,
+                ref: process.env.PR_REF,
+                inputs,
+              });
+              core.info(`Dispatched ${workflow_id} at ${owner}/${repo}:${process.env.PR_REF}`);
             }
 
   post-comment:
