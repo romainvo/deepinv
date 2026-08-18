@@ -85,7 +85,9 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1.3.2
         with:
           workflow: test_gpu.yml
+          repo: "${{ steps.pr.outputs.head_repo }}"
           ref: "${{ steps.pr.outputs.head_ref }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
           inputs: >-
             {
                 "pr_number": "${{ steps.pr.outputs.number }}",
@@ -96,7 +98,9 @@ jobs:
         uses: benc-uk/workflow-dispatch@v1.3.2
         with:
           workflow: docs_gpu.yml
+          repo: "${{ steps.pr.outputs.head_repo }}"
           ref: "${{ steps.pr.outputs.head_ref }}"
+          token: ${{ secrets.GITHUB_TOKEN }}
           inputs: >-
             {
               "pr_number": "${{ steps.pr.outputs.number }}",
