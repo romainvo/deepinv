@@ -97,7 +97,7 @@ class PnP(Prior):
         :param float sigma_denoiser: noise level parameter of the denoiser.
         :return: (torch.Tensor) proximity operator at :math:`x`.
         """
-        return self.denoiser(x, sigma_denoiser)
+        return self.denoiser(x, sigma=sigma_denoiser)
 
 
 class RED(Prior):
@@ -121,7 +121,7 @@ class RED(Prior):
         :param torch.Tensor x: Variable :math:`x` at which the gradient is computed.
         :return: (:class:`torch.Tensor`) gradient :math:`\nabla_x g`, computed in :math:`x`.
         """
-        return x - self.denoiser(x, sigma_denoiser)
+        return x - self.denoiser(x, sigma=sigma_denoiser)
 
 
 class ScorePrior(Prior):

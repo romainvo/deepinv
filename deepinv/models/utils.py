@@ -1,11 +1,22 @@
 from __future__ import annotations
-import torch
-import torch.nn as nn
 import numpy as np
-import torch.nn.functional as F
+
+import torch
 from torch import Tensor
+
+import torch.nn as nn
+import torch.nn.functional as F
+
 from torch.nn import Linear, GroupNorm
+
 from itertools import chain
+import os
+import io
+import contextlib
+import socket
+import urllib.error
+
+# from deepinv.utils.io import DownloadError
 
 
 def tensor2array(img):
@@ -469,3 +480,30 @@ class FourierEmbedding(torch.nn.Module):
         x = x.outer((2 * np.pi * self.freqs).to(x.dtype))
         x = torch.cat([x.cos(), x.sin()], dim=1)
         return x
+
+def load_state_dict_from_url(*args, **kwargs) -> dict:
+    """
+    A wrapper for :func:`torch.hub.load_state_dict_from_url` that respects the `DEEPINV_DOWNLOAD_VERBOSE`
+    environment variable. If set to 0, stdout prints are suppressed.
+
+    Network-level failures (HTTP errors, connection failures, timeouts) are
+    re-raised as :class:`deepinv.utils.DownloadError` so they can be handled
+    uniformly with other deepinv downloads.
+    """
+    # Read the environment variable. Default to "1" (True/Verbose) if not set.
+    env_value = os.environ.get("DEEPINV_DOWNLOAD_VERBOSE", "1").lower()
+
+    # Check if the user explicitly turned verbosity off
+    is_silent = env_value in ("0", "false", "no", "f")
+
+    # Choose the context manager based on the is_silent flag
+    if is_silent:
+        ctx = contextlib.redirect_stdout(io.StringIO())
+        # Optional: Also force progress=False to hide the stderr progress bar
+        kwargs["progress"] = False
+    else:
+        # nullcontext() does nothing, allowing stdout to print normally
+        ctx = contextlib.nullcontext()
+
+    with ctx:
+        return torch.hub.load_state_dict_from_url(*args, **kwargs)
